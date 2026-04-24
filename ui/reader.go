@@ -2,16 +2,21 @@ package ui
 
 import (
 	"fmt"
+	"regexp"
 	"strings"
 
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/glamour"
+	"github.com/charmbracelet/glamour/ansi"
+	"github.com/charmbracelet/glamour/styles"
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/davitostes/maily/gmail"
 	"github.com/davitostes/maily/ui/theme"
 )
+
+var ansiEscRe = regexp.MustCompile(`\x1b\[[0-9;]*m`)
 
 type ReaderModel struct {
 	theme    theme.Theme
@@ -151,25 +156,33 @@ func (m *ReaderModel) renderBody() string {
 	if strings.TrimSpace(body) == "" {
 		body = "(empty body)"
 	}
-	maxW := m.vp.Width - 4
-	if maxW < 20 {
-		maxW = 20
+	fullW := m.vp.Width
+	if fullW < 20 {
+		fullW = 20
 	}
-	if m.cachedID == m.message.ID && m.cachedWidth == maxW && m.cachedBody != "" {
+	// Adaptive wrap: use full width on small terminals, cap at ~100 cols
+	// on wide ones so lines stay readable instead of stretching edge-to-edge.
+	innerW := fullW
+	if innerW > 100 {
+		innerW = 100
+	}
+	if m.cachedID == m.message.ID && m.cachedWidth == fullW && m.cachedBody != "" {
 		return m.cachedBody
 	}
 
-	rendered := m.renderMarkdown(body, maxW)
+	inner := m.renderMarkdown(body, innerW)
+	rendered := lipgloss.PlaceHorizontal(fullW, lipgloss.Left, inner,
+		lipgloss.WithWhitespaceBackground(lipgloss.Color(theme.ColorSurface)))
 	m.cachedBody = rendered
 	m.cachedID = m.message.ID
-	m.cachedWidth = maxW
+	m.cachedWidth = fullW
 	return rendered
 }
 
 func (m *ReaderModel) renderMarkdown(body string, width int) string {
 	if m.mdRenderer == nil || m.mdRenderWidth != width {
 		r, err := glamour.NewTermRenderer(
-			glamour.WithStandardStyle("dark"),
+			glamour.WithStyles(readerStyle()),
 			glamour.WithWordWrap(width),
 		)
 		if err != nil {
@@ -180,9 +193,32 @@ func (m *ReaderModel) renderMarkdown(body string, width int) string {
 	}
 	out, err := m.mdRenderer.Render(body)
 	if err != nil {
-		return padLinesBG(wrap(body, width), width)
+		return bgBox(wrap(body, width), width)
 	}
-	return padLinesBG(strings.TrimRight(out, "\n"), width)
+	plain := ansiEscRe.ReplaceAllString(out, "")
+	return bgBox(strings.TrimRight(plain, "\n"), width)
+}
+
+// bgBox wraps content in a single lipgloss box with uniform bg across all
+// lines — no text-shaped stripes. Content must be ANSI-free so inner resets
+// don't clobber the outer bg mid-line.
+func bgBox(s string, width int) string {
+	return lipgloss.NewStyle().
+		Background(lipgloss.Color(theme.ColorSurface)).
+		Foreground(lipgloss.Color(theme.ColorFG)).
+		Width(width).
+		Render(s)
+}
+
+// readerStyle clones glamour's dark style but zeros the Document margin and
+// forces Document bg to our ColorSurface so the viewport surface stays uniform.
+func readerStyle() ansi.StyleConfig {
+	s := styles.DarkStyleConfig
+	zero := uint(0)
+	bg := theme.ColorSurface
+	s.Document.Margin = &zero
+	s.Document.BackgroundColor = &bg
+	return s
 }
 
 // padLinesBG right-pads each line to `width` with bg-styled spaces so the
