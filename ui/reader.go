@@ -6,6 +6,7 @@ import (
 
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/glamour"
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/davitostes/maily/gmail"
@@ -21,6 +22,12 @@ type ReaderModel struct {
 	headerH  int
 	ready    bool
 	hasMsg   bool
+
+	mdRenderer    *glamour.TermRenderer
+	mdRenderWidth int
+	cachedBody    string
+	cachedID      string
+	cachedWidth   int
 }
 
 func NewReader(t theme.Theme) ReaderModel {
@@ -30,6 +37,9 @@ func NewReader(t theme.Theme) ReaderModel {
 func (m *ReaderModel) SetSize(w, h int) {
 	m.width, m.height = w, h
 	m.layout()
+	if m.hasMsg {
+		m.vp.SetContent(m.renderBody())
+	}
 }
 
 func (m *ReaderModel) SetMessage(msg gmail.FullMessage) {
@@ -130,7 +140,7 @@ func (m ReaderModel) renderHeader() string {
 	return lipgloss.JoinVertical(lipgloss.Left, title, metaBlock)
 }
 
-func (m ReaderModel) renderBody() string {
+func (m *ReaderModel) renderBody() string {
 	if !m.hasMsg {
 		return ""
 	}
@@ -138,13 +148,38 @@ func (m ReaderModel) renderBody() string {
 	if strings.TrimSpace(body) == "" {
 		body = "(empty body)"
 	}
-	// wrap to viewport width
 	maxW := m.vp.Width - 4
 	if maxW < 20 {
 		maxW = 20
 	}
-	wrapped := wrap(body, maxW)
-	return wrapped
+	if m.cachedID == m.message.ID && m.cachedWidth == maxW && m.cachedBody != "" {
+		return m.cachedBody
+	}
+
+	rendered := m.renderMarkdown(body, maxW)
+	m.cachedBody = rendered
+	m.cachedID = m.message.ID
+	m.cachedWidth = maxW
+	return rendered
+}
+
+func (m *ReaderModel) renderMarkdown(body string, width int) string {
+	if m.mdRenderer == nil || m.mdRenderWidth != width {
+		r, err := glamour.NewTermRenderer(
+			glamour.WithStandardStyle("dark"),
+			glamour.WithWordWrap(width),
+		)
+		if err != nil {
+			return wrap(body, width)
+		}
+		m.mdRenderer = r
+		m.mdRenderWidth = width
+	}
+	out, err := m.mdRenderer.Render(body)
+	if err != nil {
+		return wrap(body, width)
+	}
+	return strings.TrimRight(out, "\n")
 }
 
 func (m ReaderModel) View() string {

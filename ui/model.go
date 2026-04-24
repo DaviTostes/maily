@@ -47,6 +47,11 @@ type trashResultMsg struct {
 
 type clearStatusMsg struct{}
 
+type markAllReadDoneMsg struct {
+	ids []string
+	err error
+}
+
 type Model struct {
 	state     AppState
 	prevState AppState
@@ -82,7 +87,7 @@ func New(ctx context.Context, client *gmail.Client) Model {
 		email = client.Email()
 	}
 
-	return Model{
+	m := Model{
 		state:     StateInbox,
 		theme:     t,
 		inbox:     NewInbox(t),
@@ -96,6 +101,10 @@ func New(ctx context.Context, client *gmail.Client) Model {
 		email:     email,
 		loading:   true,
 	}
+	m.statusbar.SetState(StateInbox)
+	m.help.SetFor(StateInbox)
+	m.updateHints()
+	return m
 }
 
 func (m Model) Init() tea.Cmd {
@@ -141,6 +150,13 @@ func (m Model) sendCmd(to, subject, body, inReplyTo string) tea.Cmd {
 	}
 }
 
+func (m Model) markAllReadCmd(ids []string) tea.Cmd {
+	return func() tea.Msg {
+		err := m.client.MarkAllRead(ids)
+		return markAllReadDoneMsg{ids: ids, err: err}
+	}
+}
+
 func (m Model) trashCmd(id string) tea.Cmd {
 	return func() tea.Msg {
 		err := m.client.TrashMessage(id)
@@ -166,7 +182,7 @@ func (m *Model) updateHints() {
 	var h string
 	switch m.state {
 	case StateInbox:
-		h = "↑/↓ move · Enter open · c compose · r reply · d trash · / search · ? help · q quit"
+		h = "↑/↓ move · Enter open · c compose · r reply · d trash · A read all · R refresh · / search · ? help · q quit"
 	case StateReader:
 		h = "j/k scroll · r reply · d trash · Esc back · ? help"
 	case StateCompose:
@@ -260,6 +276,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.state == StateReader {
 			m.enter(StateInbox)
 		}
+
+	case markAllReadDoneMsg:
+		m.loading = false
+		if msg.err != nil {
+			m.statusbar.SetMessage("Mark all read failed: "+truncMsg(msg.err.Error(), 50), MsgError)
+			cmds = append(cmds, clearStatusAfter(4*time.Second))
+			break
+		}
+		m.inbox.MarkAllReadLocal(msg.ids)
+		m.statusbar.SetMessage(fmt.Sprintf("Marked %d as read", len(msg.ids)), MsgSuccess)
+		cmds = append(cmds, clearStatusAfter(2*time.Second))
 
 	case clearStatusMsg:
 		m.statusbar.ClearMessage()
@@ -385,6 +412,15 @@ func (m *Model) handleInboxKey(msg tea.KeyMsg) tea.Cmd {
 		m.loading = true
 		m.statusbar.SetMessage("Refreshing…", MsgWarning)
 		return tea.Batch(m.loadInbox(m.inbox.ActiveQuery()), m.spinner.Tick)
+	case "A":
+		ids := m.inbox.UnreadIDs()
+		if len(ids) == 0 {
+			m.statusbar.SetMessage("Nothing unread", MsgWarning)
+			return clearStatusAfter(2 * time.Second)
+		}
+		m.loading = true
+		m.statusbar.SetMessage(fmt.Sprintf("Marking %d as read…", len(ids)), MsgWarning)
+		return tea.Batch(m.markAllReadCmd(ids), m.spinner.Tick)
 	}
 	return nil
 }
@@ -494,6 +530,10 @@ func (m Model) View() string {
 	var body string
 	switch m.state {
 	case StateInbox, StateSearch:
+		if m.loading && len(m.inbox.Messages()) == 0 {
+			body = m.renderInitOverlay()
+			break
+		}
 		body = m.inbox.View()
 	case StateReader:
 		body = m.reader.View()
@@ -525,6 +565,23 @@ func (m Model) View() string {
 		status = injectSpinner(status, spin)
 	}
 	return lipgloss.JoinVertical(lipgloss.Left, body, status)
+}
+
+func (m Model) renderInitOverlay() string {
+	h := m.height - 2
+	if h < 1 {
+		h = 1
+	}
+	label := lipgloss.NewStyle().
+		Foreground(lipgloss.Color(theme.ColorAccentSoft)).
+		Bold(true).
+		Render("Loading inbox…")
+	hint := lipgloss.NewStyle().
+		Foreground(lipgloss.Color(theme.ColorMuted)).
+		Render("fetching messages from Gmail")
+	block := lipgloss.JoinVertical(lipgloss.Center, m.spinner.View()+" "+label, "", hint)
+	return lipgloss.Place(m.width, h, lipgloss.Center, lipgloss.Center, block,
+		lipgloss.WithWhitespaceChars(" "))
 }
 
 func fitHeight(s string, h, w int) string {

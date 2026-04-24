@@ -71,6 +71,31 @@ func (m *InboxModel) Selected() (gmail.MessageSummary, bool) {
 	}
 	return m.messages[m.cursorRow], true
 }
+func (m *InboxModel) UnreadIDs() []string {
+	var ids []string
+	for _, msg := range m.messages {
+		if !msg.IsRead {
+			ids = append(ids, msg.ID)
+		}
+	}
+	return ids
+}
+
+func (m *InboxModel) MarkAllReadLocal(ids []string) {
+	if len(ids) == 0 {
+		return
+	}
+	set := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		set[id] = struct{}{}
+	}
+	for i := range m.messages {
+		if _, ok := set[m.messages[i].ID]; ok {
+			m.messages[i].IsRead = true
+		}
+	}
+}
+
 func (m *InboxModel) RemoveSelected() {
 	if m.cursorRow < 0 || m.cursorRow >= len(m.messages) {
 		return

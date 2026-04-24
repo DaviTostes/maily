@@ -9,8 +9,10 @@ import (
 	"net/mail"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
+	htmltomarkdown "github.com/JohannesKaufmann/html-to-markdown/v2"
 	gmailapi "google.golang.org/api/gmail/v1"
 	"google.golang.org/api/option"
 )
@@ -75,16 +77,35 @@ func (c *Client) ListInbox(maxResults int64, query string) ([]MessageSummary, er
 		return nil, fmt.Errorf("list messages: %w", err)
 	}
 
-	out := make([]MessageSummary, 0, len(list.Messages))
-	for _, stub := range list.Messages {
-		msg, err := c.svc.Users.Messages.Get("me", stub.Id).
-			Format("metadata").
-			MetadataHeaders("From", "Subject", "Date").
-			Do()
-		if err != nil {
-			continue
+	const parallelism = 15
+	results := make([]*MessageSummary, len(list.Messages))
+	sem := make(chan struct{}, parallelism)
+	var wg sync.WaitGroup
+
+	for i, stub := range list.Messages {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(i int, id string) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			msg, err := c.svc.Users.Messages.Get("me", id).
+				Format("metadata").
+				MetadataHeaders("From", "Subject", "Date").
+				Do()
+			if err != nil {
+				return
+			}
+			s := summaryFromMessage(msg)
+			results[i] = &s
+		}(i, stub.Id)
+	}
+	wg.Wait()
+
+	out := make([]MessageSummary, 0, len(results))
+	for _, r := range results {
+		if r != nil {
+			out = append(out, *r)
 		}
-		out = append(out, summaryFromMessage(msg))
 	}
 	return out, nil
 }
@@ -169,12 +190,13 @@ func (c *Client) GetMessage(id string) (FullMessage, error) {
 		full.MessageID = headerValue(msg.Payload.Headers, "Message-Id")
 		full.References = headerValue(msg.Payload.Headers, "References")
 
-		plain := pickBodyPart(msg.Payload, "text/plain")
-		if plain == "" {
-			html := pickBodyPart(msg.Payload, "text/html")
-			plain = stripHTML(html)
+		var body string
+		if html := pickBodyPart(msg.Payload, "text/html"); html != "" {
+			body = htmlToMarkdown(html)
+		} else {
+			body = pickBodyPart(msg.Payload, "text/plain")
 		}
-		full.Body = normalizeNewlines(plain)
+		full.Body = normalizeNewlines(body)
 		full.Attachments = collectAttachments(msg.Payload)
 	}
 	return full, nil
@@ -226,6 +248,17 @@ var (
 	spacesRe  = regexp.MustCompile(`[ \t]+`)
 	blankLine = regexp.MustCompile(`\n{3,}`)
 )
+
+func htmlToMarkdown(s string) string {
+	if s == "" {
+		return ""
+	}
+	md, err := htmltomarkdown.ConvertString(s)
+	if err != nil || strings.TrimSpace(md) == "" {
+		return stripHTML(s)
+	}
+	return md
+}
 
 func stripHTML(s string) string {
 	if s == "" {
@@ -303,4 +336,15 @@ func (c *Client) MarkRead(id string) error {
 		RemoveLabelIds: []string{"UNREAD"},
 	}).Do()
 	return err
+}
+
+// MarkAllRead clears the UNREAD label on every given message ID in one batch.
+func (c *Client) MarkAllRead(ids []string) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	return c.svc.Users.Messages.BatchModify("me", &gmailapi.BatchModifyMessagesRequest{
+		Ids:            ids,
+		RemoveLabelIds: []string{"UNREAD"},
+	}).Do()
 }

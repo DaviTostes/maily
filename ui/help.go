@@ -41,6 +41,8 @@ func (m HelpModel) entries() []helpEntry {
 			{"c", "compose new message"},
 			{"r", "reply to selected"},
 			{"d", "trash selected"},
+			{"R", "refresh inbox"},
+			{"A", "mark all visible as read"},
 			{"/", "search (Gmail query)"},
 			{"Esc", "clear search"},
 		}, common...)
