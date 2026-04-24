@@ -52,6 +52,7 @@ func (m HelpModel) entries() []helpEntry {
 			{"g / G", "top / bottom"},
 			{"r", "reply"},
 			{"d", "trash"},
+			{"i", "open images in external viewer"},
 			{"Esc", "back to inbox"},
 		}, common...)
 	case StateCompose:

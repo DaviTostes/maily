@@ -73,7 +73,7 @@ func (m *ReaderModel) layout() {
 	m.vp.Style = lipgloss.NewStyle().
 		Foreground(lipgloss.Color(theme.ColorFG)).
 		Background(lipgloss.Color(theme.ColorSurface)).
-		Padding(1, 2)
+		Padding(1, 0)
 }
 
 func (m *ReaderModel) Update(msg tea.Msg) tea.Cmd {
@@ -121,21 +121,24 @@ func (m ReaderModel) renderHeader() string {
 		Width(m.width).
 		Render(meta)
 
-	var attach string
-	if len(m.message.Attachments) > 0 {
-		badges := make([]string, 0, len(m.message.Attachments))
-		for _, a := range m.message.Attachments {
-			badges = append(badges, m.theme.Badge("📎 "+a, theme.ColorBG, theme.ColorAccent))
-		}
-		attach = lipgloss.NewStyle().
+	var badgeStrs []string
+	for _, a := range m.message.Attachments {
+		badgeStrs = append(badgeStrs, m.theme.Badge("📎 "+a, theme.ColorBG, theme.ColorAccent))
+	}
+	if n := len(m.message.Images); n > 0 {
+		badgeStrs = append(badgeStrs, m.theme.Badge(fmt.Sprintf("🖼 %d image(s) — press i", n), theme.ColorBG, theme.ColorAccentSoft))
+	}
+	var extras string
+	if len(badgeStrs) > 0 {
+		extras = lipgloss.NewStyle().
 			Background(lipgloss.Color(theme.ColorSurface)).
 			Padding(0, 2).
 			Width(m.width).
-			Render(strings.Join(badges, " "))
+			Render(strings.Join(badgeStrs, " "))
 	}
 
-	if attach != "" {
-		return lipgloss.JoinVertical(lipgloss.Left, title, metaBlock, attach)
+	if extras != "" {
+		return lipgloss.JoinVertical(lipgloss.Left, title, metaBlock, extras)
 	}
 	return lipgloss.JoinVertical(lipgloss.Left, title, metaBlock)
 }
@@ -170,16 +173,30 @@ func (m *ReaderModel) renderMarkdown(body string, width int) string {
 			glamour.WithWordWrap(width),
 		)
 		if err != nil {
-			return wrap(body, width)
+			return padLinesBG(wrap(body, width), width)
 		}
 		m.mdRenderer = r
 		m.mdRenderWidth = width
 	}
 	out, err := m.mdRenderer.Render(body)
 	if err != nil {
-		return wrap(body, width)
+		return padLinesBG(wrap(body, width), width)
 	}
-	return strings.TrimRight(out, "\n")
+	return padLinesBG(strings.TrimRight(out, "\n"), width)
+}
+
+// padLinesBG right-pads each line to `width` with bg-styled spaces so the
+// viewport surface color paints the full content row, not just the glyphs.
+func padLinesBG(s string, width int) string {
+	bg := lipgloss.NewStyle().Background(lipgloss.Color(theme.ColorSurface))
+	lines := strings.Split(s, "\n")
+	for i, line := range lines {
+		gap := width - lipgloss.Width(line)
+		if gap > 0 {
+			lines[i] = line + bg.Render(strings.Repeat(" ", gap))
+		}
+	}
+	return strings.Join(lines, "\n")
 }
 
 func (m ReaderModel) View() string {

@@ -24,6 +24,7 @@ type MessageSummary struct {
 	Subject       string
 	Date          time.Time
 	IsRead        bool
+	IsImportant   bool
 	HasAttachment bool
 	Snippet       string
 }
@@ -35,6 +36,7 @@ type FullMessage struct {
 	References  string
 	Body        string
 	Attachments []string
+	Images      []string // remote http(s) <img src> URLs from HTML body
 }
 
 type Client struct {
@@ -115,7 +117,8 @@ func summaryFromMessage(msg *gmailapi.Message) MessageSummary {
 		ID:       msg.Id,
 		ThreadID: msg.ThreadId,
 		Snippet:  msg.Snippet,
-		IsRead:   !hasLabel(msg.LabelIds, "UNREAD"),
+		IsRead:      !hasLabel(msg.LabelIds, "UNREAD"),
+		IsImportant: hasLabel(msg.LabelIds, "IMPORTANT"),
 	}
 	if msg.Payload != nil {
 		s.From = decodeHeader(headerValue(msg.Payload.Headers, "From"))
@@ -193,6 +196,7 @@ func (c *Client) GetMessage(id string) (FullMessage, error) {
 		var body string
 		if html := pickBodyPart(msg.Payload, "text/html"); html != "" {
 			body = htmlToMarkdown(html)
+			full.Images = extractImageURLs(html)
 		} else {
 			body = pickBodyPart(msg.Payload, "text/plain")
 		}
@@ -257,7 +261,69 @@ func htmlToMarkdown(s string) string {
 	if err != nil || strings.TrimSpace(md) == "" {
 		return stripHTML(s)
 	}
-	return md
+	return cleanupMarkdown(md)
+}
+
+var imgSrcRe = regexp.MustCompile(`(?i)<img[^>]+src=["']([^"']+)["']`)
+
+// extractImageURLs pulls remote http(s) image URLs from raw HTML, skipping
+// data: URIs and de-duplicating while preserving order.
+func extractImageURLs(html string) []string {
+	matches := imgSrcRe.FindAllStringSubmatch(html, -1)
+	if len(matches) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(matches))
+	out := make([]string, 0, len(matches))
+	for _, m := range matches {
+		u := strings.TrimSpace(m[1])
+		if u == "" || strings.HasPrefix(strings.ToLower(u), "data:") {
+			continue
+		}
+		if !strings.HasPrefix(u, "http://") && !strings.HasPrefix(u, "https://") {
+			continue
+		}
+		if _, dup := seen[u]; dup {
+			continue
+		}
+		seen[u] = struct{}{}
+		out = append(out, u)
+	}
+	return out
+}
+
+var (
+	mdImageRe        = regexp.MustCompile(`!\[[^\]]*\]\([^)]*\)`)
+	mdEmptyLinkRe    = regexp.MustCompile(`\[\s*\]\([^)]*\)`)
+	mdLinkRe         = regexp.MustCompile(`\[([^\]]+)\]\(([^)]+)\)`)
+	mdBareURLLineRe  = regexp.MustCompile(`(?m)^\s*<?https?://\S+>?\s*$`)
+	mdInlineURLRe    = regexp.MustCompile(`https?://\S+`)
+	mdEmptyParenRe   = regexp.MustCompile(`\(\s*\)`)
+	mdEmptyBracketRe = regexp.MustCompile(`\[\s*\]`)
+	mdManyBlanksRe   = regexp.MustCompile(`\n{3,}`)
+)
+
+// cleanupMarkdown strips image/link URL noise typical of marketing HTML mail.
+// Drops images entirely (alt text in newsletters is usually generic "Image"),
+// keeps link text but drops URLs, scrubs bare URLs and orphan brackets/parens.
+func cleanupMarkdown(s string) string {
+	s = mdImageRe.ReplaceAllString(s, "")
+	s = mdEmptyLinkRe.ReplaceAllString(s, "")
+	s = mdLinkRe.ReplaceAllStringFunc(s, func(m string) string {
+		sub := mdLinkRe.FindStringSubmatch(m)
+		text := strings.TrimSpace(sub[1])
+		url := strings.TrimSpace(sub[2])
+		if text == "" || text == url {
+			return ""
+		}
+		return text
+	})
+	s = mdBareURLLineRe.ReplaceAllString(s, "")
+	s = mdInlineURLRe.ReplaceAllString(s, "")
+	s = mdEmptyParenRe.ReplaceAllString(s, "")
+	s = mdEmptyBracketRe.ReplaceAllString(s, "")
+	s = mdManyBlanksRe.ReplaceAllString(s, "\n\n")
+	return s
 }
 
 func stripHTML(s string) string {

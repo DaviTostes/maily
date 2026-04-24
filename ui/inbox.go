@@ -354,6 +354,9 @@ func sameDay(a, b time.Time) bool {
 
 func renderFlags(m gmail.MessageSummary) string {
 	var parts []string
+	if m.IsImportant {
+		parts = append(parts, "★")
+	}
 	if !m.IsRead {
 		parts = append(parts, "●")
 	}

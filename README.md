@@ -121,43 +121,6 @@ maily ships with one built-in theme — a dark, high-contrast palette with laven
 
 Terminals must support 24-bit true color for accurate rendering.
 
-## Project structure
-
-```
-maily/
-├── main.go                  entry point
-├── auth/oauth.go            OAuth2 flow + token cache
-├── gmail/client.go          Gmail API wrapper
-└── ui/
-    ├── theme/theme.go       palette and pre-built lipgloss styles
-    ├── model.go             root Bubble Tea model and state machine
-    ├── inbox.go             inbox list view
-    ├── reader.go            full-message reader with viewport
-    ├── compose.go           compose / reply form
-    ├── statusbar.go         bottom status bar
-    └── help.go              help overlay
-```
-
-## Files and directories
-
-| Path | Purpose |
-|---|---|
-| `~/.config/maily/credentials.json` | Google OAuth client secret (you provide) |
-| `~/.config/maily/token.json` | cached OAuth token (auto-created, mode `0600`) |
-
-## Roadmap
-
-- [ ] Label management (apply / remove)
-- [ ] Thread view (conversation grouping)
-- [ ] HTML rendering with soft line-wrapping
-- [ ] Attachment download
-- [ ] Multiple accounts
-- [ ] Custom themes via config file
-
-## Contributing
-
-Issues and pull requests welcome. Please run `go vet ./...` and `go build ./...` before submitting.
-
 ## License
 
 [MIT](LICENSE) © Davi Tostes

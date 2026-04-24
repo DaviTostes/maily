@@ -3,6 +3,8 @@ package ui
 import (
 	"context"
 	"fmt"
+	"os/exec"
+	"runtime"
 	"strings"
 	"time"
 
@@ -13,6 +15,19 @@ import (
 	"github.com/davitostes/maily/gmail"
 	"github.com/davitostes/maily/ui/theme"
 )
+
+func openExternal(u string) {
+	var cmd *exec.Cmd
+	switch runtime.GOOS {
+	case "darwin":
+		cmd = exec.Command("open", u)
+	case "windows":
+		cmd = exec.Command("rundll32", "url.dll,FileProtocolHandler", u)
+	default:
+		cmd = exec.Command("xdg-open", u)
+	}
+	_ = cmd.Start()
+}
 
 type AppState int
 
@@ -184,7 +199,7 @@ func (m *Model) updateHints() {
 	case StateInbox:
 		h = "↑/↓ move · Enter open · c compose · r reply · d trash · A read all · R refresh · / search · ? help · q quit"
 	case StateReader:
-		h = "j/k scroll · r reply · d trash · Esc back · ? help"
+		h = "j/k scroll · r reply · d trash · i images · Esc back · ? help"
 	case StateCompose:
 		h = "Tab next · Ctrl+S send · Ctrl+D/Esc cancel"
 	case StateSearch:
@@ -482,6 +497,29 @@ func (m *Model) handleReaderKey(msg tea.KeyMsg) tea.Cmd {
 			return m.trashCmd(m.reader.Message().ID)
 		}
 		return nil
+	case "i":
+		if !m.reader.HasMessage() {
+			return nil
+		}
+		urls := m.reader.Message().Images
+		if len(urls) == 0 {
+			m.statusbar.SetMessage("No images in this message", MsgWarning)
+			return clearStatusAfter(2 * time.Second)
+		}
+		const maxOpen = 5
+		n := len(urls)
+		if n > maxOpen {
+			n = maxOpen
+		}
+		for _, u := range urls[:n] {
+			openExternal(u)
+		}
+		extra := ""
+		if len(urls) > maxOpen {
+			extra = fmt.Sprintf(" (of %d, capped at %d)", len(urls), maxOpen)
+		}
+		m.statusbar.SetMessage(fmt.Sprintf("Opened %d image(s)%s", n, extra), MsgSuccess)
+		return clearStatusAfter(2 * time.Second)
 	}
 	return m.reader.Update(msg)
 }
