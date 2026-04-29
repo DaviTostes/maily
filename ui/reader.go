@@ -18,21 +18,37 @@ import (
 
 var ansiEscRe = regexp.MustCompile(`\x1b\[[0-9;]*m`)
 
+type VisualMode int
+
+const (
+	VisualNone VisualMode = iota
+	VisualChar
+	VisualLine
+)
+
 type ReaderModel struct {
-	theme    theme.Theme
-	width    int
-	height   int
-	message  gmail.FullMessage
-	vp       viewport.Model
-	headerH  int
-	ready    bool
-	hasMsg   bool
+	theme   theme.Theme
+	width   int
+	height  int
+	message gmail.FullMessage
+	vp      viewport.Model
+	headerH int
+	ready   bool
+	hasMsg  bool
 
 	mdRenderer    *glamour.TermRenderer
 	mdRenderWidth int
-	cachedBody    string
+	cachedPlain   string
 	cachedID      string
 	cachedWidth   int
+
+	bodyLines  []string
+	bodyWidth  int
+	cursorLine int
+	cursorCol  int
+	vmode      VisualMode
+	anchorLine int
+	anchorCol  int
 }
 
 func NewReader(t theme.Theme) ReaderModel {
@@ -50,6 +66,8 @@ func (m *ReaderModel) SetSize(w, h int) {
 func (m *ReaderModel) SetMessage(msg gmail.FullMessage) {
 	m.message = msg
 	m.hasMsg = true
+	m.cursorLine, m.cursorCol = 0, 0
+	m.vmode = VisualNone
 	m.layout()
 	m.vp.SetContent(m.renderBody())
 	m.vp.GotoTop()
@@ -88,17 +106,6 @@ func (m *ReaderModel) Update(msg tea.Msg) tea.Cmd {
 	var cmd tea.Cmd
 	m.vp, cmd = m.vp.Update(msg)
 	return cmd
-}
-
-func (m *ReaderModel) GotoTop()    { m.vp.GotoTop() }
-func (m *ReaderModel) GotoBottom() { m.vp.GotoBottom() }
-
-func (m *ReaderModel) ScrollLines(n int) {
-	if n > 0 {
-		m.vp.ScrollDown(n)
-	} else if n < 0 {
-		m.vp.ScrollUp(-n)
-	}
 }
 
 func (m ReaderModel) renderHeader() string {
@@ -160,23 +167,21 @@ func (m *ReaderModel) renderBody() string {
 	if fullW < 20 {
 		fullW = 20
 	}
-	// Adaptive wrap: use full width on small terminals, cap at ~100 cols
-	// on wide ones so lines stay readable instead of stretching edge-to-edge.
 	innerW := fullW
 	if innerW > 100 {
 		innerW = 100
 	}
-	if m.cachedID == m.message.ID && m.cachedWidth == fullW && m.cachedBody != "" {
-		return m.cachedBody
+
+	if !(m.cachedID == m.message.ID && m.cachedWidth == fullW && m.cachedPlain != "") {
+		m.cachedPlain = m.renderMarkdown(body, innerW)
+		m.cachedID = m.message.ID
+		m.cachedWidth = fullW
 	}
 
-	inner := m.renderMarkdown(body, innerW)
-	rendered := lipgloss.PlaceHorizontal(fullW, lipgloss.Left, inner,
-		lipgloss.WithWhitespaceBackground(lipgloss.Color(theme.ColorSurface)))
-	m.cachedBody = rendered
-	m.cachedID = m.message.ID
-	m.cachedWidth = fullW
-	return rendered
+	m.bodyLines = strings.Split(m.cachedPlain, "\n")
+	m.bodyWidth = fullW
+	m.clampCursor()
+	return m.composeView(fullW)
 }
 
 func (m *ReaderModel) renderMarkdown(body string, width int) string {
@@ -186,28 +191,297 @@ func (m *ReaderModel) renderMarkdown(body string, width int) string {
 			glamour.WithWordWrap(width),
 		)
 		if err != nil {
-			return padLinesBG(wrap(body, width), width)
+			return wrap(body, width)
 		}
 		m.mdRenderer = r
 		m.mdRenderWidth = width
 	}
 	out, err := m.mdRenderer.Render(body)
 	if err != nil {
-		return bgBox(wrap(body, width), width)
+		return wrap(body, width)
 	}
 	plain := ansiEscRe.ReplaceAllString(out, "")
-	return bgBox(strings.TrimRight(plain, "\n"), width)
+	return strings.TrimRight(plain, "\n")
 }
 
-// bgBox wraps content in a single lipgloss box with uniform bg across all
-// lines — no text-shaped stripes. Content must be ANSI-free so inner resets
-// don't clobber the outer bg mid-line.
-func bgBox(s string, width int) string {
-	return lipgloss.NewStyle().
+func (m *ReaderModel) clampCursor() {
+	if len(m.bodyLines) == 0 {
+		m.cursorLine, m.cursorCol = 0, 0
+		return
+	}
+	if m.cursorLine < 0 {
+		m.cursorLine = 0
+	}
+	if m.cursorLine >= len(m.bodyLines) {
+		m.cursorLine = len(m.bodyLines) - 1
+	}
+	n := utf8RuneCount(m.bodyLines[m.cursorLine])
+	if m.cursorCol < 0 {
+		m.cursorCol = 0
+	}
+	if m.cursorCol > n {
+		m.cursorCol = n
+	}
+}
+
+func utf8RuneCount(s string) int { return len([]rune(s)) }
+
+func (m *ReaderModel) normalizedSel() (sL, sC, eL, eC int) {
+	aL, aC := m.anchorLine, m.anchorCol
+	cL, cC := m.cursorLine, m.cursorCol
+	if aL < cL || (aL == cL && aC <= cC) {
+		return aL, aC, cL, cC
+	}
+	return cL, cC, aL, aC
+}
+
+func (m *ReaderModel) selRangeForLine(idx, lineLen, fullW int) (start, end int, has bool) {
+	if m.vmode == VisualNone {
+		return 0, 0, false
+	}
+	sL, sC, eL, eC := m.normalizedSel()
+	if idx < sL || idx > eL {
+		return 0, 0, false
+	}
+	if m.vmode == VisualLine {
+		return 0, fullW, true
+	}
+	s, e := 0, lineLen
+	if idx == sL {
+		s = sC
+	}
+	if idx == eL {
+		e = eC + 1
+	}
+	if s < 0 {
+		s = 0
+	}
+	if e > fullW {
+		e = fullW
+	}
+	if s > fullW {
+		s = fullW
+	}
+	if s > e {
+		s = e
+	}
+	return s, e, true
+}
+
+type cellStyle int
+
+const (
+	cellBase cellStyle = iota
+	cellSel
+	cellCursor
+)
+
+func (m *ReaderModel) composeView(fullW int) string {
+	base := lipgloss.NewStyle().
 		Background(lipgloss.Color(theme.ColorSurface)).
-		Foreground(lipgloss.Color(theme.ColorFG)).
-		Width(width).
-		Render(s)
+		Foreground(lipgloss.Color(theme.ColorFG))
+	sel := lipgloss.NewStyle().
+		Background(lipgloss.Color(theme.ColorAccentSoft)).
+		Foreground(lipgloss.Color(theme.ColorBG))
+	cur := lipgloss.NewStyle().
+		Background(lipgloss.Color(theme.ColorAccent)).
+		Foreground(lipgloss.Color(theme.ColorBG))
+
+	out := make([]string, len(m.bodyLines))
+	for i, line := range m.bodyLines {
+		runes := []rune(line)
+		n := len(runes)
+		selS, selE, hasSel := m.selRangeForLine(i, n, fullW)
+		isCursorLine := i == m.cursorLine
+
+		styleAt := func(col int) cellStyle {
+			if isCursorLine && col == m.cursorCol {
+				return cellCursor
+			}
+			if hasSel && col >= selS && col < selE {
+				return cellSel
+			}
+			return cellBase
+		}
+
+		var sb strings.Builder
+		col := 0
+		for col < fullW {
+			s := styleAt(col)
+			j := col + 1
+			for j < fullW && styleAt(j) == s {
+				j++
+			}
+			var chunk strings.Builder
+			for k := col; k < j; k++ {
+				if k < n {
+					chunk.WriteRune(runes[k])
+				} else {
+					chunk.WriteByte(' ')
+				}
+			}
+			var styled string
+			switch s {
+			case cellCursor:
+				styled = cur.Render(chunk.String())
+			case cellSel:
+				styled = sel.Render(chunk.String())
+			default:
+				styled = base.Render(chunk.String())
+			}
+			sb.WriteString(styled)
+			col = j
+		}
+		out[i] = sb.String()
+	}
+	return strings.Join(out, "\n")
+}
+
+func (m *ReaderModel) refresh() {
+	if !m.hasMsg || !m.ready {
+		return
+	}
+	m.vp.SetContent(m.renderBody())
+}
+
+func (m *ReaderModel) ensureCursorVisible() {
+	top := m.vp.YOffset
+	bot := top + m.vp.Height - 1
+	if m.cursorLine < top {
+		m.vp.SetYOffset(m.cursorLine)
+	} else if m.cursorLine > bot {
+		off := m.cursorLine - m.vp.Height + 1
+		if off < 0 {
+			off = 0
+		}
+		m.vp.SetYOffset(off)
+	}
+}
+
+func (m *ReaderModel) MoveCursor(dl, dc int) {
+	if !m.hasMsg {
+		return
+	}
+	m.cursorLine += dl
+	m.cursorCol += dc
+	if m.cursorLine < 0 {
+		m.cursorLine = 0
+	}
+	if len(m.bodyLines) > 0 && m.cursorLine >= len(m.bodyLines) {
+		m.cursorLine = len(m.bodyLines) - 1
+	}
+	if m.cursorCol < 0 {
+		m.cursorCol = 0
+	}
+	if len(m.bodyLines) > 0 {
+		n := utf8RuneCount(m.bodyLines[m.cursorLine])
+		if m.cursorCol > n {
+			m.cursorCol = n
+		}
+	}
+	m.ensureCursorVisible()
+	m.refresh()
+}
+
+func (m *ReaderModel) GotoLineStart() {
+	m.cursorCol = 0
+	m.refresh()
+}
+
+func (m *ReaderModel) GotoLineEnd() {
+	if len(m.bodyLines) == 0 {
+		return
+	}
+	m.cursorCol = utf8RuneCount(m.bodyLines[m.cursorLine])
+	m.refresh()
+}
+
+func (m *ReaderModel) CursorTop() {
+	m.cursorLine, m.cursorCol = 0, 0
+	m.vp.GotoTop()
+	m.refresh()
+}
+
+func (m *ReaderModel) CursorBottom() {
+	if len(m.bodyLines) > 0 {
+		m.cursorLine = len(m.bodyLines) - 1
+		m.cursorCol = 0
+	}
+	m.ensureCursorVisible()
+	m.refresh()
+}
+
+func (m *ReaderModel) StartVisual(line bool) {
+	if !m.hasMsg {
+		return
+	}
+	if line {
+		m.vmode = VisualLine
+	} else {
+		m.vmode = VisualChar
+	}
+	m.anchorLine, m.anchorCol = m.cursorLine, m.cursorCol
+	m.refresh()
+}
+
+func (m *ReaderModel) ExitVisual() {
+	if m.vmode == VisualNone {
+		return
+	}
+	m.vmode = VisualNone
+	m.refresh()
+}
+
+func (m *ReaderModel) VisualMode() VisualMode { return m.vmode }
+
+func (m *ReaderModel) Yank() (string, bool) {
+	if len(m.bodyLines) == 0 {
+		return "", false
+	}
+	if m.vmode == VisualNone {
+		return m.bodyLines[m.cursorLine], true
+	}
+	sL, sC, eL, eC := m.normalizedSel()
+	if m.vmode == VisualLine {
+		end := eL + 1
+		if end > len(m.bodyLines) {
+			end = len(m.bodyLines)
+		}
+		return strings.Join(m.bodyLines[sL:end], "\n"), true
+	}
+	if sL == eL {
+		runes := []rune(m.bodyLines[sL])
+		n := len(runes)
+		s, e := sC, eC+1
+		if s > n {
+			s = n
+		}
+		if e > n {
+			e = n
+		}
+		if s > e {
+			s = e
+		}
+		return string(runes[s:e]), true
+	}
+	var sb strings.Builder
+	first := []rune(m.bodyLines[sL])
+	if sC > len(first) {
+		sC = len(first)
+	}
+	sb.WriteString(string(first[sC:]))
+	for i := sL + 1; i < eL; i++ {
+		sb.WriteByte('\n')
+		sb.WriteString(m.bodyLines[i])
+	}
+	last := []rune(m.bodyLines[eL])
+	e := eC + 1
+	if e > len(last) {
+		e = len(last)
+	}
+	sb.WriteByte('\n')
+	sb.WriteString(string(last[:e]))
+	return sb.String(), true
 }
 
 // readerStyle clones glamour's dark style but zeros the Document margin and
@@ -219,20 +493,6 @@ func readerStyle() ansi.StyleConfig {
 	s.Document.Margin = &zero
 	s.Document.BackgroundColor = &bg
 	return s
-}
-
-// padLinesBG right-pads each line to `width` with bg-styled spaces so the
-// viewport surface color paints the full content row, not just the glyphs.
-func padLinesBG(s string, width int) string {
-	bg := lipgloss.NewStyle().Background(lipgloss.Color(theme.ColorSurface))
-	lines := strings.Split(s, "\n")
-	for i, line := range lines {
-		gap := width - lipgloss.Width(line)
-		if gap > 0 {
-			lines[i] = line + bg.Render(strings.Repeat(" ", gap))
-		}
-	}
-	return strings.Join(lines, "\n")
 }
 
 func (m ReaderModel) View() string {

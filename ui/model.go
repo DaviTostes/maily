@@ -16,6 +16,12 @@ import (
 	"github.com/davitostes/maily/ui/theme"
 )
 
+func wlCopy(s string) error {
+	cmd := exec.Command("wl-copy")
+	cmd.Stdin = strings.NewReader(s)
+	return cmd.Run()
+}
+
 func openExternal(u string) {
 	var cmd *exec.Cmd
 	switch runtime.GOOS {
@@ -199,7 +205,7 @@ func (m *Model) updateHints() {
 	case StateInbox:
 		h = "↑/↓ move · Enter open · c compose · r reply · d trash · A read all · R refresh · / search · ? help · q quit"
 	case StateReader:
-		h = "j/k scroll · r reply · d trash · i images · Esc back · ? help"
+		h = "hjkl move · v/V visual · y yank · g/G top/bot · r reply · d trash · i images · Esc back · ? help"
 	case StateCompose:
 		h = "Tab next · Ctrl+S send · Ctrl+D/Esc cancel"
 	case StateSearch:
@@ -462,30 +468,74 @@ func (m *Model) handleSearchKey(msg tea.KeyMsg) tea.Cmd {
 
 func (m *Model) handleReaderKey(msg tea.KeyMsg) tea.Cmd {
 	switch msg.String() {
-	case "q", "esc":
+	case "q":
+		m.enter(StateInbox)
+		return nil
+	case "esc":
+		if m.reader.VisualMode() != VisualNone {
+			m.reader.ExitVisual()
+			return nil
+		}
 		m.enter(StateInbox)
 		return nil
 	case "?":
 		m.enter(StateHelp)
 		return nil
 	case "j", "down":
-		m.reader.ScrollLines(1)
+		m.reader.MoveCursor(1, 0)
 		return nil
 	case "k", "up":
-		m.reader.ScrollLines(-1)
+		m.reader.MoveCursor(-1, 0)
+		return nil
+	case "h", "left":
+		m.reader.MoveCursor(0, -1)
+		return nil
+	case "l", "right":
+		m.reader.MoveCursor(0, 1)
 		return nil
 	case "pgdown", " ":
-		m.reader.ScrollLines(10)
+		m.reader.MoveCursor(10, 0)
 		return nil
 	case "pgup":
-		m.reader.ScrollLines(-10)
+		m.reader.MoveCursor(-10, 0)
+		return nil
+	case "ctrl+d":
+		m.reader.MoveCursor(10, 0)
+		return nil
+	case "ctrl+u":
+		m.reader.MoveCursor(-10, 0)
+		return nil
+	case "0", "home":
+		m.reader.GotoLineStart()
+		return nil
+	case "$", "end":
+		m.reader.GotoLineEnd()
 		return nil
 	case "g":
-		m.reader.GotoTop()
+		m.reader.CursorTop()
 		return nil
 	case "G":
-		m.reader.GotoBottom()
+		m.reader.CursorBottom()
 		return nil
+	case "v":
+		m.reader.StartVisual(false)
+		return nil
+	case "V":
+		m.reader.StartVisual(true)
+		return nil
+	case "y":
+		text, ok := m.reader.Yank()
+		if !ok {
+			return nil
+		}
+		if err := wlCopy(text); err != nil {
+			m.statusbar.SetMessage("Copy failed: "+truncMsg(err.Error(), 50), MsgError)
+			return clearStatusAfter(4 * time.Second)
+		}
+		m.reader.ExitVisual()
+		n := len(text)
+		m.statusbar.SetMessage(fmt.Sprintf("Yanked %d bytes", n), MsgSuccess)
+		return clearStatusAfter(2 * time.Second)
 	case "r":
 		if m.reader.HasMessage() {
 			m.compose.PrepareReply(m.reader.Message())
