@@ -64,6 +64,27 @@ func (m *InboxModel) SetMessages(ms []gmail.MessageSummary) {
 	m.scrollTop = 0
 }
 
+// MergeMessages replaces the list while keeping the cursor on the same
+// message (by ID) and preserving scroll offset when possible.
+func (m *InboxModel) MergeMessages(ms []gmail.MessageSummary) {
+	var selID string
+	if sel, ok := m.Selected(); ok {
+		selID = sel.ID
+	}
+	m.messages = ms
+	if selID != "" {
+		for i := range ms {
+			if ms[i].ID == selID {
+				m.cursorRow = i
+				return
+			}
+		}
+	}
+	if m.cursorRow >= len(ms) {
+		m.cursorRow = max0(len(ms) - 1)
+	}
+}
+
 func (m *InboxModel) Messages() []gmail.MessageSummary { return m.messages }
 func (m *InboxModel) Selected() (gmail.MessageSummary, bool) {
 	if m.cursorRow < 0 || m.cursorRow >= len(m.messages) {

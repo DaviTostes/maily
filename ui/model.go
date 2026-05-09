@@ -73,6 +73,15 @@ type markAllReadDoneMsg struct {
 	err error
 }
 
+type pollTickMsg struct{}
+
+type pollResultMsg struct {
+	messages []gmail.MessageSummary
+	err      error
+}
+
+const pollInterval = 15 * time.Second
+
 type Model struct {
 	state     AppState
 	prevState AppState
@@ -95,6 +104,9 @@ type Model struct {
 	email    string
 	lastErr  error
 	lastHint string
+
+	seenIDs     map[string]bool
+	pollStarted bool
 }
 
 func New(ctx context.Context, client *gmail.Client) Model {
@@ -142,6 +154,45 @@ func (m *Model) propagateSize() {
 	m.compose.SetSize(m.width, bodyH)
 	m.statusbar.SetWidth(m.width)
 	m.help.SetSize(m.width, m.height)
+}
+
+func pollTickCmd() tea.Cmd {
+	return tea.Tick(pollInterval, func(time.Time) tea.Msg { return pollTickMsg{} })
+}
+
+func (m Model) pollFetch(query string) tea.Cmd {
+	return func() tea.Msg {
+		if m.client == nil {
+			return pollResultMsg{err: fmt.Errorf("gmail client not initialized")}
+		}
+		msgs, err := m.client.ListInbox(50, query)
+		return pollResultMsg{messages: msgs, err: err}
+	}
+}
+
+func notifyNewMail(items []gmail.MessageSummary) {
+	if len(items) == 0 {
+		return
+	}
+	title := fmt.Sprintf("Maily: %d new email(s)", len(items))
+	var bodyLines []string
+	const maxShown = 3
+	for i, it := range items {
+		if i >= maxShown {
+			break
+		}
+		from := it.From
+		subj := it.Subject
+		if subj == "" {
+			subj = "(no subject)"
+		}
+		bodyLines = append(bodyLines, truncMsg(from, 40)+" — "+truncMsg(subj, 60))
+	}
+	if len(items) > maxShown {
+		bodyLines = append(bodyLines, fmt.Sprintf("…and %d more", len(items)-maxShown))
+	}
+	cmd := exec.Command("notify-send", "-a", "maily", "-i", "mail-message-new", title, strings.Join(bodyLines, "\n"))
+	_ = cmd.Start()
 }
 
 func (m Model) loadInbox(query string) tea.Cmd {
@@ -205,7 +256,7 @@ func (m *Model) updateHints() {
 	case StateInbox:
 		h = "↑/↓ move · Enter open · c compose · r reply · d trash · A read all · R refresh · / search · ? help · q quit"
 	case StateReader:
-		h = "hjkl move · v/V visual · y yank · g/G top/bot · r reply · d trash · i images · Esc back · ? help"
+		h = "hjkl · w/b/e · v/V visual · viw · yy/yiw · o open link · g/G · r reply · d trash · I images · Esc · ?"
 	case StateCompose:
 		h = "Tab next · Ctrl+S send · Ctrl+D/Esc cancel"
 	case StateSearch:
@@ -243,6 +294,51 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.statusbar.SetEmail(m.email)
 			m.statusbar.SetMessage(fmt.Sprintf("Loaded %d", len(msg.messages)), MsgSuccess)
 			cmds = append(cmds, clearStatusAfter(2*time.Second))
+			// Seed seen-IDs from the first successful load so the very first
+			// poll doesn't notify about pre-existing messages.
+			if m.seenIDs == nil {
+				m.seenIDs = make(map[string]bool, len(msg.messages))
+				for _, it := range msg.messages {
+					m.seenIDs[it.ID] = true
+				}
+			}
+			if !m.pollStarted {
+				m.pollStarted = true
+				cmds = append(cmds, pollTickCmd())
+			}
+		}
+
+	case pollTickMsg:
+		// Only poll when not actively editing; queries that match the active
+		// search (or the full inbox if no query) get refreshed silently.
+		if m.state == StateCompose || m.state == StateSearch {
+			cmds = append(cmds, pollTickCmd())
+			break
+		}
+		cmds = append(cmds, m.pollFetch(m.inbox.ActiveQuery()))
+
+	case pollResultMsg:
+		// Always reschedule, even on error.
+		cmds = append(cmds, pollTickCmd())
+		if msg.err != nil {
+			break
+		}
+		var fresh []gmail.MessageSummary
+		for _, it := range msg.messages {
+			if !m.seenIDs[it.ID] {
+				fresh = append(fresh, it)
+				m.seenIDs[it.ID] = true
+			}
+		}
+		// Mark every observed ID as seen so removed-then-re-added IDs don't re-notify.
+		for _, it := range msg.messages {
+			m.seenIDs[it.ID] = true
+		}
+		m.inbox.MergeMessages(msg.messages)
+		if len(fresh) > 0 {
+			notifyNewMail(fresh)
+			m.statusbar.SetMessage(fmt.Sprintf("%d new email(s)", len(fresh)), MsgSuccess)
+			cmds = append(cmds, clearStatusAfter(3*time.Second))
 		}
 
 	case messageLoadedMsg:
@@ -467,7 +563,14 @@ func (m *Model) handleSearchKey(msg tea.KeyMsg) tea.Cmd {
 }
 
 func (m *Model) handleReaderKey(msg tea.KeyMsg) tea.Cmd {
-	switch msg.String() {
+	key := msg.String()
+
+	// Multi-key sequences (operator/text-object pending).
+	if p := m.reader.Pending(); p != "" {
+		return m.handleReaderPending(p, key)
+	}
+
+	switch key {
 	case "q":
 		m.enter(StateInbox)
 		return nil
@@ -517,25 +620,43 @@ func (m *Model) handleReaderKey(msg tea.KeyMsg) tea.Cmd {
 	case "G":
 		m.reader.CursorBottom()
 		return nil
+	case "w":
+		m.reader.WordForward(false)
+		return nil
+	case "W":
+		m.reader.WordForward(true)
+		return nil
+	case "b":
+		m.reader.WordBackward(false)
+		return nil
+	case "B":
+		m.reader.WordBackward(true)
+		return nil
+	case "e":
+		m.reader.WordEnd(false)
+		return nil
+	case "E":
+		m.reader.WordEnd(true)
+		return nil
 	case "v":
 		m.reader.StartVisual(false)
 		return nil
 	case "V":
 		m.reader.StartVisual(true)
 		return nil
+	case "i", "a":
+		// Text-object selection inside visual mode.
+		if m.reader.VisualMode() != VisualNone {
+			m.reader.SetPending(key)
+		}
+		return nil
 	case "y":
-		text, ok := m.reader.Yank()
-		if !ok {
-			return nil
+		if m.reader.VisualMode() != VisualNone {
+			return m.yankAndCopy(false)
 		}
-		if err := wlCopy(text); err != nil {
-			m.statusbar.SetMessage("Copy failed: "+truncMsg(err.Error(), 50), MsgError)
-			return clearStatusAfter(4 * time.Second)
-		}
-		m.reader.ExitVisual()
-		n := len(text)
-		m.statusbar.SetMessage(fmt.Sprintf("Yanked %d bytes", n), MsgSuccess)
-		return clearStatusAfter(2 * time.Second)
+		// Operator-pending: wait for next key (yy, yiw, yaw, …).
+		m.reader.SetPending("y")
+		return nil
 	case "r":
 		if m.reader.HasMessage() {
 			m.compose.PrepareReply(m.reader.Message())
@@ -547,7 +668,16 @@ func (m *Model) handleReaderKey(msg tea.KeyMsg) tea.Cmd {
 			return m.trashCmd(m.reader.Message().ID)
 		}
 		return nil
-	case "i":
+	case "o":
+		url := m.reader.LinkUnderCursor()
+		if url == "" {
+			m.statusbar.SetMessage("No link under cursor", MsgWarning)
+			return clearStatusAfter(2 * time.Second)
+		}
+		openExternal(url)
+		m.statusbar.SetMessage("Opened "+truncMsg(url, 60), MsgSuccess)
+		return clearStatusAfter(2 * time.Second)
+	case "I":
 		if !m.reader.HasMessage() {
 			return nil
 		}
@@ -572,6 +702,110 @@ func (m *Model) handleReaderKey(msg tea.KeyMsg) tea.Cmd {
 		return clearStatusAfter(2 * time.Second)
 	}
 	return m.reader.Update(msg)
+}
+
+func (m *Model) yankAndCopy(exitVisual bool) tea.Cmd {
+	text, ok := m.reader.Yank()
+	if !ok {
+		return nil
+	}
+	if err := wlCopy(text); err != nil {
+		m.statusbar.SetMessage("Copy failed: "+truncMsg(err.Error(), 50), MsgError)
+		return clearStatusAfter(4 * time.Second)
+	}
+	if exitVisual || m.reader.VisualMode() != VisualNone {
+		m.reader.ExitVisual()
+	}
+	m.statusbar.SetMessage(fmt.Sprintf("Yanked %d bytes", len(text)), MsgSuccess)
+	return clearStatusAfter(2 * time.Second)
+}
+
+// applyTextObject sets a visual selection over the requested object.
+// Returns true if the noun was recognized.
+func (m *Model) applyTextObject(noun string, around bool) bool {
+	switch noun {
+	case "w":
+		m.reader.SelectWord(false, around)
+	case "W":
+		m.reader.SelectWord(true, around)
+	case "\"":
+		m.reader.SelectQuote('"', around)
+	case "'":
+		m.reader.SelectQuote('\'', around)
+	case "`":
+		m.reader.SelectQuote('`', around)
+	case "(", ")", "b":
+		m.reader.SelectBracket('(', ')', around)
+	case "[", "]":
+		m.reader.SelectBracket('[', ']', around)
+	case "{", "}", "B":
+		m.reader.SelectBracket('{', '}', around)
+	case "p":
+		m.reader.SelectParagraph(around)
+	default:
+		return false
+	}
+	return true
+}
+
+func (m *Model) handleReaderPending(p, key string) tea.Cmd {
+	switch p {
+	case "y":
+		m.reader.ClearPending()
+		switch key {
+		case "y":
+			// yy — yank current line
+			text, ok := m.reader.YankLine()
+			if !ok {
+				return nil
+			}
+			if err := wlCopy(text); err != nil {
+				m.statusbar.SetMessage("Copy failed: "+truncMsg(err.Error(), 50), MsgError)
+				return clearStatusAfter(4 * time.Second)
+			}
+			m.statusbar.SetMessage(fmt.Sprintf("Yanked %d bytes", len(text)), MsgSuccess)
+			return clearStatusAfter(2 * time.Second)
+		case "i":
+			m.reader.SetPending("yi")
+			return nil
+		case "a":
+			m.reader.SetPending("ya")
+			return nil
+		case "esc":
+			return nil
+		}
+		return nil
+	case "yi", "ya":
+		m.reader.ClearPending()
+		around := p == "ya"
+		if key == "esc" {
+			return nil
+		}
+		hadVisual := m.reader.VisualMode() != VisualNone
+		if !hadVisual {
+			m.reader.StartVisual(false)
+		}
+		if !m.applyTextObject(key, around) {
+			if !hadVisual {
+				m.reader.ExitVisual()
+			}
+			return nil
+		}
+		return m.yankAndCopy(true)
+	case "i", "a":
+		m.reader.ClearPending()
+		if key == "esc" {
+			return nil
+		}
+		around := p == "a"
+		if m.reader.VisualMode() == VisualNone {
+			m.reader.StartVisual(false)
+		}
+		m.applyTextObject(key, around)
+		return nil
+	}
+	m.reader.ClearPending()
+	return nil
 }
 
 func (m *Model) handleComposeKey(msg tea.KeyMsg) tea.Cmd {

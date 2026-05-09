@@ -296,30 +296,30 @@ var (
 	mdImageRe        = regexp.MustCompile(`!\[[^\]]*\]\([^)]*\)`)
 	mdEmptyLinkRe    = regexp.MustCompile(`\[\s*\]\([^)]*\)`)
 	mdLinkRe         = regexp.MustCompile(`\[([^\]]+)\]\(([^)]+)\)`)
-	mdBareURLLineRe  = regexp.MustCompile(`(?m)^\s*<?https?://\S+>?\s*$`)
-	mdInlineURLRe    = regexp.MustCompile(`https?://\S+`)
 	mdEmptyParenRe   = regexp.MustCompile(`\(\s*\)`)
 	mdEmptyBracketRe = regexp.MustCompile(`\[\s*\]`)
 	mdManyBlanksRe   = regexp.MustCompile(`\n{3,}`)
 )
 
-// cleanupMarkdown strips image/link URL noise typical of marketing HTML mail.
-// Drops images entirely (alt text in newsletters is usually generic "Image"),
-// keeps link text but drops URLs, scrubs bare URLs and orphan brackets/parens.
+// cleanupMarkdown strips image noise typical of marketing HTML mail and
+// collapses dead artifacts. Markdown links [text](url) are preserved so the
+// reader can render them as clickable hyperlinks.
 func cleanupMarkdown(s string) string {
 	s = mdImageRe.ReplaceAllString(s, "")
 	s = mdEmptyLinkRe.ReplaceAllString(s, "")
+	// Drop self-referential links where text == url (visual noise, no extra info).
 	s = mdLinkRe.ReplaceAllStringFunc(s, func(m string) string {
 		sub := mdLinkRe.FindStringSubmatch(m)
 		text := strings.TrimSpace(sub[1])
 		url := strings.TrimSpace(sub[2])
-		if text == "" || text == url {
+		if text == "" {
 			return ""
 		}
-		return text
+		if text == url {
+			return text
+		}
+		return m
 	})
-	s = mdBareURLLineRe.ReplaceAllString(s, "")
-	s = mdInlineURLRe.ReplaceAllString(s, "")
 	s = mdEmptyParenRe.ReplaceAllString(s, "")
 	s = mdEmptyBracketRe.ReplaceAllString(s, "")
 	s = mdManyBlanksRe.ReplaceAllString(s, "\n\n")

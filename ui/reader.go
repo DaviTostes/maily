@@ -18,6 +18,18 @@ import (
 
 var ansiEscRe = regexp.MustCompile(`\x1b\[[0-9;]*m`)
 
+// URL regex: matches http/https/ftp/mailto. Trailing punctuation trimmed below.
+var urlRe = regexp.MustCompile(`(?:https?|ftp|mailto):[^\s<>"\x60]+`)
+
+// Markdown inline link: [text](url). Bracketed link refs and angle-URL forms ignored.
+var mdLinkRe = regexp.MustCompile(`\[([^\]]+)\]\(([^)\s]+)(?:\s+"[^"]*")?\)`)
+
+type linkRange struct {
+	start int
+	end   int
+	url   string
+}
+
 type VisualMode int
 
 const (
@@ -43,13 +55,20 @@ type ReaderModel struct {
 	cachedWidth   int
 
 	bodyLines  []string
+	lineLinks  [][]linkRange
 	bodyWidth  int
 	cursorLine int
 	cursorCol  int
 	vmode      VisualMode
 	anchorLine int
 	anchorCol  int
+
+	pending string
 }
+
+func (m *ReaderModel) Pending() string    { return m.pending }
+func (m *ReaderModel) SetPending(p string) { m.pending = p }
+func (m *ReaderModel) ClearPending()       { m.pending = "" }
 
 func NewReader(t theme.Theme) ReaderModel {
 	return ReaderModel{theme: t}
@@ -172,16 +191,146 @@ func (m *ReaderModel) renderBody() string {
 		innerW = 100
 	}
 
+	// Extract markdown inline links and replace with their text so glamour
+	// doesn't render the URL inline (where it gets ugly-wrapped).
+	mdLinks, stripped := stripMarkdownLinks(body)
+
 	if !(m.cachedID == m.message.ID && m.cachedWidth == fullW && m.cachedPlain != "") {
-		m.cachedPlain = m.renderMarkdown(body, innerW)
+		m.cachedPlain = m.renderMarkdown(stripped, innerW)
 		m.cachedID = m.message.ID
 		m.cachedWidth = fullW
 	}
 
 	m.bodyLines = strings.Split(m.cachedPlain, "\n")
+	m.lineLinks = make([][]linkRange, len(m.bodyLines))
+	for i, line := range m.bodyLines {
+		m.lineLinks[i] = extractLinks(line)
+	}
+	mapMarkdownLinks(mdLinks, m.bodyLines, m.lineLinks)
 	m.bodyWidth = fullW
 	m.clampCursor()
 	return m.composeView(fullW)
+}
+
+type mdLinkInfo struct {
+	text string
+	url  string
+}
+
+// stripMarkdownLinks extracts inline [text](url) links from raw markdown in
+// order and returns the body with each replaced by just its text.
+func stripMarkdownLinks(raw string) ([]mdLinkInfo, string) {
+	var links []mdLinkInfo
+	stripped := mdLinkRe.ReplaceAllStringFunc(raw, func(m string) string {
+		sub := mdLinkRe.FindStringSubmatch(m)
+		text, url := sub[1], sub[2]
+		links = append(links, mdLinkInfo{text: text, url: url})
+		return text
+	})
+	return links, stripped
+}
+
+// mapMarkdownLinks locates each link's text within the rendered plain lines
+// and records matching link ranges. Whitespace between words is flexible to
+// handle wrap reflow.
+func mapMarkdownLinks(links []mdLinkInfo, lines []string, lineLinks [][]linkRange) {
+	if len(links) == 0 {
+		return
+	}
+	// global rune buffer of the plain rendering, plus a map from rune index → (line, col).
+	type pos struct{ line, col int }
+	var posMap []pos
+	var sb strings.Builder
+	for li, line := range lines {
+		for ci, r := range []rune(line) {
+			posMap = append(posMap, pos{li, ci})
+			sb.WriteRune(r)
+		}
+		// represent newline as a single space-equivalent so \s+ matchers cross lines.
+		if li < len(lines)-1 {
+			posMap = append(posMap, pos{li, -1})
+			sb.WriteRune('\n')
+		}
+	}
+	hayRunes := []rune(sb.String())
+	hay := string(hayRunes)
+	cursor := 0 // rune offset
+
+	for _, link := range links {
+		text, url := link.text, link.url
+		words := strings.Fields(text)
+		if len(words) == 0 {
+			continue
+		}
+		parts := make([]string, len(words))
+		for i, w := range words {
+			parts[i] = regexp.QuoteMeta(w)
+		}
+		pat := strings.Join(parts, `\s+`)
+		re, err := regexp.Compile(pat)
+		if err != nil {
+			continue
+		}
+		// Search byte-wise on hay starting at the byte offset matching cursor runes.
+		byteCursor := len(string(hayRunes[:cursor]))
+		loc := re.FindStringIndex(hay[byteCursor:])
+		if loc == nil {
+			continue
+		}
+		startByte := byteCursor + loc[0]
+		endByte := byteCursor + loc[1]
+		startRune := utf8RuneCount(hay[:startByte])
+		endRune := utf8RuneCount(hay[:endByte])
+		cursor = endRune
+
+		// Emit per-line ranges; newline placeholders (col == -1) split segments.
+		curLine, curStart, curEnd := -1, -1, -1
+		flush := func() {
+			if curLine >= 0 {
+				lineLinks[curLine] = append(lineLinks[curLine], linkRange{
+					start: curStart, end: curEnd, url: url,
+				})
+			}
+			curLine, curStart, curEnd = -1, -1, -1
+		}
+		for i := startRune; i < endRune; i++ {
+			p := posMap[i]
+			if p.col < 0 {
+				flush()
+				continue
+			}
+			if curLine != p.line {
+				flush()
+				curLine = p.line
+				curStart = p.col
+			}
+			curEnd = p.col + 1
+		}
+		flush()
+	}
+}
+
+// extractLinks returns rune-indexed link ranges within line.
+func extractLinks(line string) []linkRange {
+	matches := urlRe.FindAllStringIndex(line, -1)
+	if len(matches) == 0 {
+		return nil
+	}
+	out := make([]linkRange, 0, len(matches))
+	for _, m := range matches {
+		raw := line[m[0]:m[1]]
+		// trim trailing punctuation that's likely sentence terminator
+		trimmed := strings.TrimRight(raw, ".,;:!?)]}>")
+		end := m[0] + len(trimmed)
+		// convert byte indices to rune indices
+		startRune := utf8RuneCount(line[:m[0]])
+		endRune := utf8RuneCount(line[:end])
+		if endRune <= startRune {
+			continue
+		}
+		out = append(out, linkRange{start: startRune, end: endRune, url: trimmed})
+	}
+	return out
 }
 
 func (m *ReaderModel) renderMarkdown(body string, width int) string {
@@ -286,6 +435,10 @@ func (m *ReaderModel) composeView(fullW int) string {
 	cur := lipgloss.NewStyle().
 		Background(lipgloss.Color(theme.ColorAccent)).
 		Foreground(lipgloss.Color(theme.ColorBG))
+	link := lipgloss.NewStyle().
+		Background(lipgloss.Color(theme.ColorSurface)).
+		Foreground(lipgloss.Color(theme.ColorAccentSoft)).
+		Underline(true)
 
 	out := make([]string, len(m.bodyLines))
 	for i, line := range m.bodyLines {
@@ -293,6 +446,19 @@ func (m *ReaderModel) composeView(fullW int) string {
 		n := len(runes)
 		selS, selE, hasSel := m.selRangeForLine(i, n, fullW)
 		isCursorLine := i == m.cursorLine
+
+		links := m.lineLinks[i]
+		linkAt := func(col int) string {
+			if col >= n {
+				return ""
+			}
+			for _, lr := range links {
+				if col >= lr.start && col < lr.end {
+					return lr.url
+				}
+			}
+			return ""
+		}
 
 		styleAt := func(col int) cellStyle {
 			if isCursorLine && col == m.cursorCol {
@@ -308,8 +474,9 @@ func (m *ReaderModel) composeView(fullW int) string {
 		col := 0
 		for col < fullW {
 			s := styleAt(col)
+			url := linkAt(col)
 			j := col + 1
-			for j < fullW && styleAt(j) == s {
+			for j < fullW && styleAt(j) == s && linkAt(j) == url {
 				j++
 			}
 			var chunk strings.Builder
@@ -327,7 +494,14 @@ func (m *ReaderModel) composeView(fullW int) string {
 			case cellSel:
 				styled = sel.Render(chunk.String())
 			default:
-				styled = base.Render(chunk.String())
+				if url != "" {
+					styled = link.Render(chunk.String())
+				} else {
+					styled = base.Render(chunk.String())
+				}
+			}
+			if url != "" {
+				styled = "\x1b]8;;" + url + "\x07" + styled + "\x1b]8;;\x07"
 			}
 			sb.WriteString(styled)
 			col = j
@@ -550,3 +724,453 @@ func wrapLine(line string, w int) string {
 }
 
 var _ = fmt.Sprintf
+
+// --- Vim motions / text objects ---
+
+func isWordRune(r rune) bool {
+	return r == '_' ||
+		(r >= '0' && r <= '9') ||
+		(r >= 'a' && r <= 'z') ||
+		(r >= 'A' && r <= 'Z') ||
+		r >= 0x80
+}
+
+func isSpaceRune(r rune) bool { return r == ' ' || r == '\t' }
+
+// charClass: 0 = space, 1 = word, 2 = punct. With big=true everything non-space is class 1.
+func charClass(r rune, big bool) int {
+	if isSpaceRune(r) {
+		return 0
+	}
+	if big {
+		return 1
+	}
+	if isWordRune(r) {
+		return 1
+	}
+	return 2
+}
+
+func (m *ReaderModel) lineRunes(i int) []rune {
+	if i < 0 || i >= len(m.bodyLines) {
+		return nil
+	}
+	return []rune(m.bodyLines[i])
+}
+
+func (m *ReaderModel) WordForward(big bool) {
+	if !m.hasMsg || len(m.bodyLines) == 0 {
+		return
+	}
+	line, col := m.cursorLine, m.cursorCol
+	runes := m.lineRunes(line)
+	n := len(runes)
+
+	// Determine current class; if at/after EOL treat as space (advance to next line).
+	var startClass int
+	if col >= n {
+		startClass = 0
+	} else {
+		startClass = charClass(runes[col], big)
+	}
+
+	advance := func() bool {
+		if col+1 < n {
+			col++
+			return true
+		}
+		if line+1 < len(m.bodyLines) {
+			line++
+			runes = m.lineRunes(line)
+			n = len(runes)
+			col = 0
+			return true
+		}
+		return false
+	}
+
+	// Skip rest of current run (if non-space), then skip whitespace.
+	for col < n && charClass(runes[col], big) == startClass && startClass != 0 {
+		if !advance() {
+			break
+		}
+	}
+	// At end of line — fall through to advance once (which moves to next line col 0).
+	if col >= n {
+		if !advance() {
+			m.cursorLine, m.cursorCol = line, n
+			m.ensureCursorVisible()
+			m.refresh()
+			return
+		}
+	}
+	for col < n && charClass(runes[col], big) == 0 {
+		if !advance() {
+			break
+		}
+	}
+	m.cursorLine, m.cursorCol = line, col
+	m.clampCursor()
+	m.ensureCursorVisible()
+	m.refresh()
+}
+
+func (m *ReaderModel) WordBackward(big bool) {
+	if !m.hasMsg || len(m.bodyLines) == 0 {
+		return
+	}
+	line, col := m.cursorLine, m.cursorCol
+	runes := m.lineRunes(line)
+
+	step := func() bool {
+		if col > 0 {
+			col--
+			return true
+		}
+		if line > 0 {
+			line--
+			runes = m.lineRunes(line)
+			col = len(runes)
+			return true
+		}
+		return false
+	}
+
+	// Step back once before classification (vim semantics).
+	if !step() {
+		return
+	}
+	// Skip whitespace.
+	for {
+		if col < len(runes) && charClass(runes[col], big) != 0 {
+			break
+		}
+		if !step() {
+			m.cursorLine, m.cursorCol = line, col
+			m.clampCursor()
+			m.ensureCursorVisible()
+			m.refresh()
+			return
+		}
+	}
+	c := charClass(runes[col], big)
+	for col > 0 && charClass(runes[col-1], big) == c {
+		col--
+	}
+	m.cursorLine, m.cursorCol = line, col
+	m.clampCursor()
+	m.ensureCursorVisible()
+	m.refresh()
+}
+
+func (m *ReaderModel) WordEnd(big bool) {
+	if !m.hasMsg || len(m.bodyLines) == 0 {
+		return
+	}
+	line, col := m.cursorLine, m.cursorCol
+	runes := m.lineRunes(line)
+	n := len(runes)
+
+	advance := func() bool {
+		if col+1 < n {
+			col++
+			return true
+		}
+		if line+1 < len(m.bodyLines) {
+			line++
+			runes = m.lineRunes(line)
+			n = len(runes)
+			col = 0
+			return true
+		}
+		return false
+	}
+
+	if !advance() {
+		return
+	}
+	// Skip whitespace.
+	for col < n && charClass(runes[col], big) == 0 {
+		if !advance() {
+			m.cursorLine, m.cursorCol = line, col
+			m.clampCursor()
+			m.ensureCursorVisible()
+			m.refresh()
+			return
+		}
+	}
+	if col >= n {
+		m.cursorLine, m.cursorCol = line, col
+		m.clampCursor()
+		m.ensureCursorVisible()
+		m.refresh()
+		return
+	}
+	c := charClass(runes[col], big)
+	for col+1 < n && charClass(runes[col+1], big) == c {
+		col++
+	}
+	m.cursorLine, m.cursorCol = line, col
+	m.clampCursor()
+	m.ensureCursorVisible()
+	m.refresh()
+}
+
+func (m *ReaderModel) SelectWord(big, around bool) {
+	if !m.hasMsg || len(m.bodyLines) == 0 {
+		return
+	}
+	runes := m.lineRunes(m.cursorLine)
+	n := len(runes)
+	if n == 0 {
+		return
+	}
+	col := m.cursorCol
+	if col >= n {
+		col = n - 1
+	}
+	c := charClass(runes[col], big)
+	s, e := col, col
+	for s > 0 && charClass(runes[s-1], big) == c {
+		s--
+	}
+	for e+1 < n && charClass(runes[e+1], big) == c {
+		e++
+	}
+	if around {
+		if c == 0 {
+			// pure whitespace under cursor — extend to surrounding word
+			if e+1 < n {
+				ec := charClass(runes[e+1], big)
+				for e+1 < n && charClass(runes[e+1], big) == ec {
+					e++
+				}
+			} else if s > 0 {
+				sc := charClass(runes[s-1], big)
+				for s > 0 && charClass(runes[s-1], big) == sc {
+					s--
+				}
+			}
+		} else {
+			// extend trailing whitespace; if none, extend leading.
+			if e+1 < n && charClass(runes[e+1], big) == 0 {
+				for e+1 < n && charClass(runes[e+1], big) == 0 {
+					e++
+				}
+			} else {
+				for s > 0 && charClass(runes[s-1], big) == 0 {
+					s--
+				}
+			}
+		}
+	}
+	m.vmode = VisualChar
+	m.anchorLine, m.anchorCol = m.cursorLine, s
+	m.cursorCol = e
+	m.ensureCursorVisible()
+	m.refresh()
+}
+
+func (m *ReaderModel) SelectQuote(q rune, around bool) {
+	if !m.hasMsg || len(m.bodyLines) == 0 {
+		return
+	}
+	runes := m.lineRunes(m.cursorLine)
+	n := len(runes)
+	col := m.cursorCol
+	if col > n {
+		col = n
+	}
+	// find left quote at or before col
+	l := -1
+	for i := col; i >= 0 && i < n; i-- {
+		if runes[i] == q {
+			l = i
+			break
+		}
+	}
+	if l < 0 {
+		// search forward instead
+		for i := col; i < n; i++ {
+			if runes[i] == q {
+				l = i
+				break
+			}
+		}
+		if l < 0 {
+			return
+		}
+	}
+	r := -1
+	for i := l + 1; i < n; i++ {
+		if runes[i] == q {
+			r = i
+			break
+		}
+	}
+	if r < 0 {
+		return
+	}
+	var s, e int
+	if around {
+		s, e = l, r
+	} else {
+		if r-l < 2 {
+			return
+		}
+		s, e = l+1, r-1
+	}
+	m.vmode = VisualChar
+	m.anchorLine, m.anchorCol = m.cursorLine, s
+	m.cursorCol = e
+	m.ensureCursorVisible()
+	m.refresh()
+}
+
+// findBracketPair searches outward across multiple lines for matched open/close.
+func (m *ReaderModel) findBracketPair(open, close rune) (sL, sC, eL, eC int, ok bool) {
+	cl, cc := m.cursorLine, m.cursorCol
+	// search backward for unmatched open
+	depth := 0
+	sL, sC = -1, -1
+	for line := cl; line >= 0; line-- {
+		runes := m.lineRunes(line)
+		start := len(runes) - 1
+		if line == cl {
+			start = cc
+			if start >= len(runes) {
+				start = len(runes) - 1
+			}
+		}
+		for i := start; i >= 0; i-- {
+			r := runes[i]
+			if r == close && !(line == cl && i == cc) {
+				depth++
+			} else if r == open {
+				if depth == 0 {
+					sL, sC = line, i
+					line = -1
+					break
+				}
+				depth--
+			}
+		}
+		if sL >= 0 {
+			break
+		}
+	}
+	if sL < 0 {
+		return 0, 0, 0, 0, false
+	}
+	// search forward from after open
+	depth = 0
+	for line := sL; line < len(m.bodyLines); line++ {
+		runes := m.lineRunes(line)
+		i := 0
+		if line == sL {
+			i = sC + 1
+		}
+		for ; i < len(runes); i++ {
+			r := runes[i]
+			if r == open {
+				depth++
+			} else if r == close {
+				if depth == 0 {
+					return sL, sC, line, i, true
+				}
+				depth--
+			}
+		}
+	}
+	return 0, 0, 0, 0, false
+}
+
+func (m *ReaderModel) SelectBracket(open, close rune, around bool) {
+	sL, sC, eL, eC, ok := m.findBracketPair(open, close)
+	if !ok {
+		return
+	}
+	if !around {
+		// inner: skip the brackets themselves
+		sC++
+		eC--
+		// empty pair
+		if sL == eL && sC > eC {
+			return
+		}
+	}
+	m.vmode = VisualChar
+	m.anchorLine, m.anchorCol = sL, sC
+	m.cursorLine, m.cursorCol = eL, eC
+	m.ensureCursorVisible()
+	m.refresh()
+}
+
+func (m *ReaderModel) SelectParagraph(around bool) {
+	if !m.hasMsg || len(m.bodyLines) == 0 {
+		return
+	}
+	isBlank := func(s string) bool { return strings.TrimSpace(s) == "" }
+	cl := m.cursorLine
+	s, e := cl, cl
+	if isBlank(m.bodyLines[cl]) {
+		// expand blank run
+		for s > 0 && isBlank(m.bodyLines[s-1]) {
+			s--
+		}
+		for e+1 < len(m.bodyLines) && isBlank(m.bodyLines[e+1]) {
+			e++
+		}
+	} else {
+		for s > 0 && !isBlank(m.bodyLines[s-1]) {
+			s--
+		}
+		for e+1 < len(m.bodyLines) && !isBlank(m.bodyLines[e+1]) {
+			e++
+		}
+	}
+	if around {
+		// include trailing blank lines, else leading
+		if e+1 < len(m.bodyLines) && isBlank(m.bodyLines[e+1]) {
+			for e+1 < len(m.bodyLines) && isBlank(m.bodyLines[e+1]) {
+				e++
+			}
+		} else {
+			for s > 0 && isBlank(m.bodyLines[s-1]) {
+				s--
+			}
+		}
+	}
+	m.vmode = VisualLine
+	m.anchorLine, m.anchorCol = s, 0
+	m.cursorLine, m.cursorCol = e, 0
+	m.ensureCursorVisible()
+	m.refresh()
+}
+
+// LinkUnderCursor returns the URL of the link at the cursor, if any.
+func (m *ReaderModel) LinkUnderCursor() string {
+	if m.cursorLine < 0 || m.cursorLine >= len(m.lineLinks) {
+		return ""
+	}
+	for _, lr := range m.lineLinks[m.cursorLine] {
+		if m.cursorCol >= lr.start && m.cursorCol < lr.end {
+			return lr.url
+		}
+	}
+	// also accept clicking exactly at end+0 boundary
+	for _, lr := range m.lineLinks[m.cursorLine] {
+		if m.cursorCol == lr.end {
+			return lr.url
+		}
+	}
+	return ""
+}
+
+// YankLine returns the cursor's current line (used by `yy`).
+func (m *ReaderModel) YankLine() (string, bool) {
+	if len(m.bodyLines) == 0 {
+		return "", false
+	}
+	return m.bodyLines[m.cursorLine], true
+}

@@ -7,9 +7,10 @@ Read, search, reply, compose, and triage your inbox without leaving the terminal
 ## Features
 
 - **Inbox** — zebra-striped table with per-cell cursor, unread emphasis, and flag column for attachments and read state.
-- **Reader** — full-message view with scrollable body, header block, and attachment badges.
+- **Reader** — vim-style navigation, visual selection with text objects, clickable links (OSC 8 + accent underline), and attachment badges.
 - **Compose** — plaintext compose with `To` / `Subject` / `Body` fields, focus cycling, and reply threading via `In-Reply-To` / `References`.
 - **Search** — full Gmail query syntax (e.g. `is:unread from:boss@corp.com newer_than:7d`).
+- **Background poll** — refreshes every 15s and fires a `notify-send` desktop notification for new mail.
 - **Trash** — one-key archive to Gmail trash.
 - **Help overlay** — context-aware keybinding table on `?`.
 - **Responsive layout** — all views recompute on terminal resize.
@@ -81,16 +82,26 @@ maily
 | `?` | toggle help |
 | `q` / `Ctrl+C` | quit |
 
-**Reader**
+**Reader** (vim motions)
 
 | Keys | Action |
 |---|---|
-| `j` / `k` or `↑` / `↓` | scroll body |
-| `Space` / `PgDn`, `PgUp` | page scroll |
+| `h` / `j` / `k` / `l` | move cursor |
+| `w` / `b` / `e` (`W` / `B` / `E`) | word / WORD motions |
+| `0` / `$` | line start / end |
 | `g` / `G` | top / bottom |
+| `Ctrl+D` / `Ctrl+U`, `Space` / `PgUp` | page scroll |
+| `v` / `V` | visual char / line |
+| `i{obj}` / `a{obj}` (in visual) | inner / around — objects: `w W " ' \` ( [ { p` |
+| `y` | yank selection (wl-copy) |
+| `yy` / `yiw` / `yaw` / `yip` … | operator-pending yank |
+| `o` | open link under cursor (`xdg-open`) |
 | `r` | reply |
 | `d` | trash |
-| `Esc` | back to inbox |
+| `I` | open images in external viewer |
+| `Esc` | exit visual / back to inbox |
+
+Markdown links are rendered with an accent underline and emit OSC 8 hyperlink escapes — clickable in terminals that support it (kitty, foot, wezterm, gnome-terminal — usually `Ctrl+Click`). Press `o` to open via `xdg-open` regardless of terminal support.
 
 **Compose**
 
@@ -100,7 +111,9 @@ maily
 | `Ctrl+S` | send |
 | `Ctrl+D` / `Esc` | discard |
 
-## Theme
+## Notifications
+
+While running, maily polls Gmail every 15s in the background and merges new messages into the inbox without disturbing your cursor. New mail triggers a desktop notification via `notify-send` (requires `libnotify` on Linux). The first poll after startup never notifies — initial inbox state is treated as already-seen.
 
 maily ships with one built-in theme — a dark, high-contrast palette with lavender and cyan accents. Colors are defined in [`ui/theme/theme.go`](ui/theme/theme.go):
 

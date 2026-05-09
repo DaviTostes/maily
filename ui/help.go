@@ -49,14 +49,21 @@ func (m HelpModel) entries() []helpEntry {
 	case StateReader:
 		return append([]helpEntry{
 			{"h/j/k/l", "move cursor"},
+			{"w / b / e", "word forward / back / end"},
+			{"W / B / E", "WORD forward / back / end"},
 			{"0 / $", "line start / end"},
 			{"g / G", "top / bottom"},
 			{"Ctrl+D / Ctrl+U", "page down / up"},
 			{"v / V", "visual char / line"},
+			{"i{obj} / a{obj}", "inner / around (in visual)"},
+			{"objects", "w W \" ' ` ( [ { p"},
 			{"y", "yank selection (wl-copy)"},
+			{"yy", "yank current line"},
+			{"yiw / yaw", "yank inner / around word"},
+			{"o", "open link under cursor"},
 			{"r", "reply"},
 			{"d", "trash"},
-			{"i", "open images in external viewer"},
+			{"I", "open images in external viewer"},
 			{"Esc", "exit visual / back to inbox"},
 		}, common...)
 	case StateCompose:
