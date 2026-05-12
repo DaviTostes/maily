@@ -24,6 +24,31 @@ const (
 
 const inboxColumnCount = 4
 
+type Mailbox int
+
+const (
+	MailboxInbox Mailbox = iota
+	MailboxSent
+)
+
+func (mb Mailbox) Label() string {
+	switch mb {
+	case MailboxSent:
+		return "Sent"
+	default:
+		return "Inbox"
+	}
+}
+
+func (mb Mailbox) QueryPrefix() string {
+	switch mb {
+	case MailboxSent:
+		return "in:sent"
+	default:
+		return "in:inbox"
+	}
+}
+
 type InboxModel struct {
 	theme       theme.Theme
 	width       int
@@ -35,6 +60,7 @@ type InboxModel struct {
 	search      textinput.Model
 	searching   bool
 	activeQuery string
+	mailbox     Mailbox
 }
 
 func NewInbox(t theme.Theme) InboxModel {
@@ -148,6 +174,16 @@ func (m *InboxModel) CommitSearch() string {
 	return q
 }
 func (m *InboxModel) ActiveQuery() string { return m.activeQuery }
+func (m *InboxModel) Mailbox() Mailbox    { return m.mailbox }
+func (m *InboxModel) SetMailbox(mb Mailbox) {
+	m.mailbox = mb
+	m.cursorRow = 0
+	m.scrollTop = 0
+}
+func (m *InboxModel) CycleMailbox(delta int) {
+	const n = 2
+	m.SetMailbox(Mailbox(((int(m.mailbox)+delta)%n + n) % n))
+}
 func (m *InboxModel) ClearQuery() {
 	m.activeQuery = ""
 	m.search.SetValue("")
@@ -184,8 +220,8 @@ func (m *InboxModel) ensureCursorVisible() {
 }
 
 func (m InboxModel) visibleRows() int {
-	// header row + search shell + bottom padding
-	reserved := 2
+	// tab row + header row + search shell + bottom padding
+	reserved := 3
 	if m.searching || m.activeQuery != "" {
 		reserved += 3
 	}
@@ -213,6 +249,28 @@ func (m InboxModel) columnWidths() (fromW, subjW, dateW, flagW int) {
 	return
 }
 
+func (m InboxModel) renderTabs() string {
+	tabs := []Mailbox{MailboxInbox, MailboxSent}
+	active := lipgloss.NewStyle().
+		Foreground(lipgloss.Color(theme.ColorBG)).
+		Background(lipgloss.Color(theme.ColorAccent)).
+		Bold(true).
+		Padding(0, 2)
+	idle := lipgloss.NewStyle().
+		Foreground(lipgloss.Color(theme.ColorMuted)).
+		Padding(0, 2)
+	var cells []string
+	for _, mb := range tabs {
+		label := mb.Label()
+		if mb == m.mailbox {
+			cells = append(cells, active.Render(label))
+		} else {
+			cells = append(cells, idle.Render(label))
+		}
+	}
+	return lipgloss.JoinHorizontal(lipgloss.Top, cells...)
+}
+
 func (m InboxModel) View() string {
 	if m.width <= 0 || m.height <= 0 {
 		return ""
@@ -221,9 +279,17 @@ func (m InboxModel) View() string {
 
 	var b strings.Builder
 
+	// Tab bar
+	b.WriteString(m.renderTabs())
+	b.WriteString("\n")
+
+	fromLabel := "FROM"
+	if m.mailbox == MailboxSent {
+		fromLabel = "TO"
+	}
 	// Header
 	header := joinCells(
-		m.theme.HeaderCell.Width(fromW).Render("FROM"),
+		m.theme.HeaderCell.Width(fromW).Render(fromLabel),
 		m.theme.HeaderCell.Width(subjW).Render("SUBJECT"),
 		m.theme.HeaderCell.Width(dateW).Render("DATE"),
 		m.theme.HeaderCell.Width(flagW).Render(""),
@@ -241,7 +307,11 @@ func (m InboxModel) View() string {
 		msg := m.messages[i]
 		isCursorRow := i == m.cursorRow
 
-		from := truncate(displayFrom(msg.From), fromW-2)
+		personRaw := msg.From
+		if m.mailbox == MailboxSent {
+			personRaw = msg.To
+		}
+		from := truncate(displayFrom(personRaw), fromW-2)
 		subj := truncate(displaySubject(msg), subjW-2)
 		date := truncate(humanDate(msg.Date), dateW-2)
 		flags := renderFlags(msg)

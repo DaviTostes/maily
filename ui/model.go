@@ -3,6 +3,7 @@ package ui
 import (
 	"context"
 	"fmt"
+	"os"
 	"os/exec"
 	"runtime"
 	"strings"
@@ -48,6 +49,7 @@ const (
 // Msgs
 
 type inboxLoadedMsg struct {
+	mailbox  Mailbox
 	messages []gmail.MessageSummary
 	err      error
 }
@@ -76,8 +78,15 @@ type markAllReadDoneMsg struct {
 type pollTickMsg struct{}
 
 type pollResultMsg struct {
+	mailbox  Mailbox
 	messages []gmail.MessageSummary
 	err      error
+}
+
+type mailboxBucket struct {
+	messages []gmail.MessageSummary
+	seen     map[string]bool
+	loaded   bool
 }
 
 const pollInterval = 15 * time.Second
@@ -105,7 +114,7 @@ type Model struct {
 	lastErr  error
 	lastHint string
 
-	seenIDs     map[string]bool
+	buckets     [2]mailboxBucket
 	pollStarted bool
 }
 
@@ -141,7 +150,11 @@ func New(ctx context.Context, client *gmail.Client) Model {
 }
 
 func (m Model) Init() tea.Cmd {
-	return tea.Batch(m.spinner.Tick, m.loadInbox(""))
+	return tea.Batch(
+		m.spinner.Tick,
+		m.loadInbox(MailboxInbox, MailboxInbox.QueryPrefix()),
+		m.loadInbox(MailboxSent, MailboxSent.QueryPrefix()),
+	)
 }
 
 func (m *Model) propagateSize() {
@@ -160,13 +173,13 @@ func pollTickCmd() tea.Cmd {
 	return tea.Tick(pollInterval, func(time.Time) tea.Msg { return pollTickMsg{} })
 }
 
-func (m Model) pollFetch(query string) tea.Cmd {
+func (m Model) pollFetch(mb Mailbox, query string) tea.Cmd {
 	return func() tea.Msg {
 		if m.client == nil {
-			return pollResultMsg{err: fmt.Errorf("gmail client not initialized")}
+			return pollResultMsg{mailbox: mb, err: fmt.Errorf("gmail client not initialized")}
 		}
 		msgs, err := m.client.ListInbox(50, query)
-		return pollResultMsg{messages: msgs, err: err}
+		return pollResultMsg{mailbox: mb, messages: msgs, err: err}
 	}
 }
 
@@ -195,14 +208,40 @@ func notifyNewMail(items []gmail.MessageSummary) {
 	_ = cmd.Start()
 }
 
-func (m Model) loadInbox(query string) tea.Cmd {
+func (m Model) effectiveQuery() string {
+	prefix := m.inbox.Mailbox().QueryPrefix()
+	q := strings.TrimSpace(m.inbox.ActiveQuery())
+	if q == "" {
+		return prefix
+	}
+	return prefix + " " + q
+}
+
+func (m Model) loadInbox(mb Mailbox, query string) tea.Cmd {
 	return func() tea.Msg {
 		if m.client == nil {
-			return inboxLoadedMsg{err: fmt.Errorf("gmail client not initialized")}
+			return inboxLoadedMsg{mailbox: mb, err: fmt.Errorf("gmail client not initialized")}
 		}
 		msgs, err := m.client.ListInbox(50, query)
-		return inboxLoadedMsg{messages: msgs, err: err}
+		return inboxLoadedMsg{mailbox: mb, messages: msgs, err: err}
 	}
+}
+
+func (m *Model) showCachedMailbox() {
+	b := m.buckets[m.inbox.Mailbox()]
+	m.inbox.SetMessages(b.messages)
+	if b.loaded {
+		m.statusbar.SetMessage(m.inbox.Mailbox().Label()+": "+fmt.Sprint(len(b.messages)), MsgSuccess)
+	} else {
+		m.statusbar.SetMessage("Loading "+m.inbox.Mailbox().Label()+"…", MsgWarning)
+	}
+}
+
+func (m Model) queryFor(mb Mailbox) string {
+	if mb == m.inbox.Mailbox() {
+		return m.effectiveQuery()
+	}
+	return mb.QueryPrefix()
 }
 
 func (m Model) loadMessage(id string) tea.Cmd {
@@ -215,9 +254,9 @@ func (m Model) loadMessage(id string) tea.Cmd {
 	}
 }
 
-func (m Model) sendCmd(to, subject, body, inReplyTo string) tea.Cmd {
+func (m Model) sendCmd(to, subject, body, inReplyTo, references, threadID string) tea.Cmd {
 	return func() tea.Msg {
-		err := m.client.SendMessage(to, subject, body, inReplyTo)
+		err := m.client.SendMessage(to, subject, body, inReplyTo, references, threadID)
 		return sendResultMsg{err: err}
 	}
 }
@@ -254,11 +293,11 @@ func (m *Model) updateHints() {
 	var h string
 	switch m.state {
 	case StateInbox:
-		h = "↑/↓ move · Enter open · c compose · r reply · d trash · A read all · R refresh · / search · ? help · q quit"
+		h = "↑/↓ move · Enter open · Tab switch tabs · c compose · r reply · d trash · A read all · R refresh · / search · ? help · q quit"
 	case StateReader:
 		h = "hjkl · w/b/e · v/V visual · viw · yy/yiw · o open link · g/G · r reply · d trash · I images · Esc · ?"
 	case StateCompose:
-		h = "Tab next · Ctrl+S send · Ctrl+D/Esc cancel"
+		h = "Tab next · w edit body in $EDITOR · Ctrl+S send · Ctrl+D/Esc cancel"
 	case StateSearch:
 		h = "Enter run · Esc cancel"
 	case StateHelp:
@@ -284,58 +323,69 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	case inboxLoadedMsg:
-		m.loading = false
+		b := &m.buckets[msg.mailbox]
 		if msg.err != nil {
-			m.lastErr = msg.err
-			m.statusbar.SetMessage(truncMsg(msg.err.Error(), 60), MsgError)
-			cmds = append(cmds, clearStatusAfter(4*time.Second))
-		} else {
+			if msg.mailbox == m.inbox.Mailbox() {
+				m.loading = false
+				m.lastErr = msg.err
+				m.statusbar.SetMessage(truncMsg(msg.err.Error(), 60), MsgError)
+				cmds = append(cmds, clearStatusAfter(4*time.Second))
+			}
+			break
+		}
+		b.messages = msg.messages
+		b.loaded = true
+		if b.seen == nil {
+			b.seen = make(map[string]bool, len(msg.messages))
+			for _, it := range msg.messages {
+				b.seen[it.ID] = true
+			}
+		}
+		if msg.mailbox == m.inbox.Mailbox() {
+			m.loading = false
 			m.inbox.SetMessages(msg.messages)
 			m.statusbar.SetEmail(m.email)
 			m.statusbar.SetMessage(fmt.Sprintf("Loaded %d", len(msg.messages)), MsgSuccess)
 			cmds = append(cmds, clearStatusAfter(2*time.Second))
-			// Seed seen-IDs from the first successful load so the very first
-			// poll doesn't notify about pre-existing messages.
-			if m.seenIDs == nil {
-				m.seenIDs = make(map[string]bool, len(msg.messages))
-				for _, it := range msg.messages {
-					m.seenIDs[it.ID] = true
-				}
-			}
-			if !m.pollStarted {
-				m.pollStarted = true
-				cmds = append(cmds, pollTickCmd())
-			}
+		}
+		if !m.pollStarted {
+			m.pollStarted = true
+			cmds = append(cmds, pollTickCmd())
 		}
 
 	case pollTickMsg:
-		// Only poll when not actively editing; queries that match the active
-		// search (or the full inbox if no query) get refreshed silently.
+		// Always reschedule first so a transient error doesn't kill polling.
+		cmds = append(cmds, pollTickCmd())
+		// Skip refresh while editing/searching.
 		if m.state == StateCompose || m.state == StateSearch {
-			cmds = append(cmds, pollTickCmd())
 			break
 		}
-		cmds = append(cmds, m.pollFetch(m.inbox.ActiveQuery()))
+		cmds = append(cmds,
+			m.pollFetch(MailboxInbox, m.queryFor(MailboxInbox)),
+			m.pollFetch(MailboxSent, m.queryFor(MailboxSent)),
+		)
 
 	case pollResultMsg:
-		// Always reschedule, even on error.
-		cmds = append(cmds, pollTickCmd())
 		if msg.err != nil {
 			break
 		}
+		b := &m.buckets[msg.mailbox]
+		if b.seen == nil {
+			b.seen = make(map[string]bool, len(msg.messages))
+		}
 		var fresh []gmail.MessageSummary
 		for _, it := range msg.messages {
-			if !m.seenIDs[it.ID] {
+			if !b.seen[it.ID] {
 				fresh = append(fresh, it)
-				m.seenIDs[it.ID] = true
 			}
+			b.seen[it.ID] = true
 		}
-		// Mark every observed ID as seen so removed-then-re-added IDs don't re-notify.
-		for _, it := range msg.messages {
-			m.seenIDs[it.ID] = true
+		b.messages = msg.messages
+		b.loaded = true
+		if msg.mailbox == m.inbox.Mailbox() {
+			m.inbox.MergeMessages(msg.messages)
 		}
-		m.inbox.MergeMessages(msg.messages)
-		if len(fresh) > 0 {
+		if len(fresh) > 0 && msg.mailbox == MailboxInbox {
 			notifyNewMail(fresh)
 			m.statusbar.SetMessage(fmt.Sprintf("%d new email(s)", len(fresh)), MsgSuccess)
 			cmds = append(cmds, clearStatusAfter(3*time.Second))
@@ -390,6 +440,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 		m.inbox.SetMessages(msgs)
+		m.buckets[m.inbox.Mailbox()].messages = msgs
 		if m.state == StateReader {
 			m.enter(StateInbox)
 		}
@@ -523,12 +574,20 @@ func (m *Model) handleInboxKey(msg tea.KeyMsg) tea.Cmd {
 			m.inbox.ClearQuery()
 			m.loading = true
 			m.statusbar.SetMessage("Refreshing…", MsgWarning)
-			return tea.Batch(m.loadInbox(""), m.spinner.Tick)
+			return tea.Batch(m.loadInbox(m.inbox.Mailbox(), m.effectiveQuery()), m.spinner.Tick)
 		}
 	case "R":
 		m.loading = true
 		m.statusbar.SetMessage("Refreshing…", MsgWarning)
-		return tea.Batch(m.loadInbox(m.inbox.ActiveQuery()), m.spinner.Tick)
+		return tea.Batch(m.loadInbox(m.inbox.Mailbox(), m.effectiveQuery()), m.spinner.Tick)
+	case "tab":
+		m.inbox.CycleMailbox(1)
+		m.inbox.ClearQuery()
+		m.showCachedMailbox()
+	case "shift+tab":
+		m.inbox.CycleMailbox(-1)
+		m.inbox.ClearQuery()
+		m.showCachedMailbox()
 	case "A":
 		ids := m.inbox.UnreadIDs()
 		if len(ids) == 0 {
@@ -546,6 +605,40 @@ type replyLoadedMsg struct {
 	msg gmail.FullMessage
 }
 
+type editBodyDoneMsg struct {
+	body string
+	err  error
+}
+
+func openEditorCmd(initial string) tea.Cmd {
+	f, err := os.CreateTemp("", "maily-*.md")
+	if err != nil {
+		return func() tea.Msg { return editBodyDoneMsg{err: err} }
+	}
+	path := f.Name()
+	if initial != "" {
+		_, _ = f.WriteString(initial)
+	}
+	_ = f.Close()
+
+	editor := os.Getenv("EDITOR")
+	if editor == "" {
+		editor = "nvim"
+	}
+	c := exec.Command(editor, path)
+	return tea.ExecProcess(c, func(err error) tea.Msg {
+		defer os.Remove(path)
+		if err != nil {
+			return editBodyDoneMsg{err: err}
+		}
+		data, rerr := os.ReadFile(path)
+		if rerr != nil {
+			return editBodyDoneMsg{err: rerr}
+		}
+		return editBodyDoneMsg{body: string(data)}
+	})
+}
+
 func (m *Model) handleSearchKey(msg tea.KeyMsg) tea.Cmd {
 	switch msg.Type {
 	case tea.KeyEsc:
@@ -553,11 +646,11 @@ func (m *Model) handleSearchKey(msg tea.KeyMsg) tea.Cmd {
 		m.enter(StateInbox)
 		return nil
 	case tea.KeyEnter:
-		q := m.inbox.CommitSearch()
+		_ = m.inbox.CommitSearch()
 		m.enter(StateInbox)
 		m.loading = true
 		m.statusbar.SetMessage("Searching…", MsgWarning)
-		return tea.Batch(m.loadInbox(q), m.spinner.Tick)
+		return tea.Batch(m.loadInbox(m.inbox.Mailbox(), m.effectiveQuery()), m.spinner.Tick)
 	}
 	return m.inbox.UpdateSearch(msg)
 }
@@ -661,6 +754,7 @@ func (m *Model) handleReaderKey(msg tea.KeyMsg) tea.Cmd {
 		if m.reader.HasMessage() {
 			m.compose.PrepareReply(m.reader.Message())
 			m.enter(StateCompose)
+			return openEditorCmd(m.compose.Body())
 		}
 		return nil
 	case "d":
@@ -822,7 +916,7 @@ func (m *Model) handleComposeKey(msg tea.KeyMsg) tea.Cmd {
 		m.sending = true
 		m.statusbar.SetMessage("Sending…", MsgWarning)
 		return tea.Batch(
-			m.sendCmd(m.compose.To(), m.compose.Subject(), m.compose.Body(), m.compose.InReplyTo()),
+			m.sendCmd(m.compose.To(), m.compose.Subject(), m.compose.Body(), m.compose.InReplyTo(), m.compose.References(), m.compose.ThreadID()),
 			m.spinner.Tick,
 		)
 	case tea.KeyTab:
@@ -831,6 +925,9 @@ func (m *Model) handleComposeKey(msg tea.KeyMsg) tea.Cmd {
 	case tea.KeyShiftTab:
 		m.compose.CycleFocus(-1)
 		return nil
+	}
+	if m.compose.BodyFocused() && msg.String() == "w" {
+		return openEditorCmd(m.compose.Body())
 	}
 	// special-case "?" toggles help only if not in a text field? keep help explicit via other means.
 	return m.compose.Update(msg)
@@ -945,6 +1042,14 @@ func (m Model) updateExtra(msg tea.Msg) (tea.Model, tea.Cmd, bool) {
 		m.loading = false
 		m.compose.PrepareReply(rl.msg)
 		m.enter(StateCompose)
+		return m, openEditorCmd(m.compose.Body()), true
+	}
+	if eb, ok := msg.(editBodyDoneMsg); ok {
+		if eb.err != nil {
+			m.statusbar.SetMessage("Editor: "+truncMsg(eb.err.Error(), 50), MsgError)
+			return m, clearStatusAfter(4 * time.Second), true
+		}
+		m.compose.SetBody(eb.body)
 		return m, nil, true
 	}
 	return m, nil, false

@@ -21,6 +21,7 @@ type MessageSummary struct {
 	ID            string
 	ThreadID      string
 	From          string
+	To            string
 	Subject       string
 	Date          time.Time
 	IsRead        bool
@@ -92,7 +93,7 @@ func (c *Client) ListInbox(maxResults int64, query string) ([]MessageSummary, er
 			defer func() { <-sem }()
 			msg, err := c.svc.Users.Messages.Get("me", id).
 				Format("metadata").
-				MetadataHeaders("From", "Subject", "Date").
+				MetadataHeaders("From", "To", "Subject", "Date").
 				Do()
 			if err != nil {
 				return
@@ -122,6 +123,7 @@ func summaryFromMessage(msg *gmailapi.Message) MessageSummary {
 	}
 	if msg.Payload != nil {
 		s.From = decodeHeader(headerValue(msg.Payload.Headers, "From"))
+		s.To = decodeHeader(headerValue(msg.Payload.Headers, "To"))
 		s.Subject = decodeHeader(headerValue(msg.Payload.Headers, "Subject"))
 		if d := headerValue(msg.Payload.Headers, "Date"); d != "" {
 			if t, err := mail.ParseDate(d); err == nil {
@@ -353,8 +355,9 @@ func normalizeNewlines(s string) string {
 }
 
 // SendMessage sends a plaintext email. If inReplyTo is non-empty, adds
-// In-Reply-To and References headers.
-func (c *Client) SendMessage(to, subject, body, inReplyTo string) error {
+// In-Reply-To and References headers; threadID groups the message into an
+// existing Gmail thread so the reply shows up as a conversation, not a new one.
+func (c *Client) SendMessage(to, subject, body, inReplyTo, references, threadID string) error {
 	var buf strings.Builder
 	fmt.Fprintf(&buf, "From: %s\r\n", c.email)
 	fmt.Fprintf(&buf, "To: %s\r\n", to)
@@ -364,13 +367,20 @@ func (c *Client) SendMessage(to, subject, body, inReplyTo string) error {
 	fmt.Fprintf(&buf, "Content-Transfer-Encoding: 8bit\r\n")
 	if inReplyTo != "" {
 		fmt.Fprintf(&buf, "In-Reply-To: %s\r\n", inReplyTo)
-		fmt.Fprintf(&buf, "References: %s\r\n", inReplyTo)
+		refs := strings.TrimSpace(references)
+		if refs == "" {
+			refs = inReplyTo
+		}
+		fmt.Fprintf(&buf, "References: %s\r\n", refs)
 	}
 	buf.WriteString("\r\n")
 	buf.WriteString(body)
 
 	raw := base64.URLEncoding.EncodeToString([]byte(buf.String()))
 	msg := &gmailapi.Message{Raw: raw}
+	if threadID != "" {
+		msg.ThreadId = threadID
+	}
 	_, err := c.svc.Users.Messages.Send("me", msg).Do()
 	if err != nil {
 		return fmt.Errorf("send: %w", err)

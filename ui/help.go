@@ -38,6 +38,7 @@ func (m HelpModel) entries() []helpEntry {
 			{"↑/↓ or j/k", "move cursor"},
 			{"h/l or ←/→", "move cursor column"},
 			{"Enter", "open selected email"},
+			{"Tab", "switch tabs"},
 			{"c", "compose new message"},
 			{"r", "reply to selected"},
 			{"d", "trash selected"},
@@ -69,6 +70,7 @@ func (m HelpModel) entries() []helpEntry {
 	case StateCompose:
 		return append([]helpEntry{
 			{"Tab / Shift+Tab", "cycle fields"},
+			{"w", "edit body in $EDITOR (when Body focused)"},
 			{"Ctrl+S", "send"},
 			{"Ctrl+D", "discard"},
 			{"Esc", "discard and return"},
