@@ -73,14 +73,7 @@ func New() Theme {
 		Foreground(fg).
 		Background(surfaceBright).
 		Bold(true).
-		BorderStyle(lipgloss.NormalBorder()).
-		BorderLeft(true).
-		BorderRight(true).
-		BorderTop(false).
-		BorderBottom(false).
-		BorderForeground(accent).
-		BorderBackground(surfaceBright).
-		Padding(0, 0)
+		Padding(0, 1)
 
 	headerCell := lipgloss.NewStyle().
 		Foreground(headerFG).

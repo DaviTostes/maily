@@ -26,6 +26,7 @@ type MessageSummary struct {
 	Date          time.Time
 	IsRead        bool
 	IsImportant   bool
+	IsStarred     bool
 	HasAttachment bool
 	Snippet       string
 }
@@ -120,6 +121,7 @@ func summaryFromMessage(msg *gmailapi.Message) MessageSummary {
 		Snippet:  msg.Snippet,
 		IsRead:      !hasLabel(msg.LabelIds, "UNREAD"),
 		IsImportant: hasLabel(msg.LabelIds, "IMPORTANT"),
+		IsStarred:   hasLabel(msg.LabelIds, "STARRED"),
 	}
 	if msg.Payload != nil {
 		s.From = decodeHeader(headerValue(msg.Payload.Headers, "From"))

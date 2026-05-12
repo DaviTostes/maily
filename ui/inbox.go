@@ -16,10 +16,10 @@ import (
 type inboxColumn int
 
 const (
-	colFrom inboxColumn = iota
+	colFlags inboxColumn = iota
+	colFrom
 	colSubject
 	colDate
-	colFlags
 )
 
 const inboxColumnCount = 4
@@ -240,9 +240,9 @@ func (m InboxModel) columnWidths() (fromW, subjW, dateW, flagW int) {
 	}
 	fromW = 22
 	dateW = 14
-	flagW = 5
-	// account for 3 gaps (1 space each)
-	subjW = total - fromW - dateW - flagW - 3
+	flagW = 1
+	// account for 2 gaps (1 space each); no gap after flag column
+	subjW = total - fromW - dateW - flagW - 2
 	if subjW < 10 {
 		subjW = 10
 	}
@@ -288,11 +288,10 @@ func (m InboxModel) View() string {
 		fromLabel = "TO"
 	}
 	// Header
-	header := joinCells(
+	header := m.theme.HeaderCell.Width(flagW).Render("") + joinCells(
 		m.theme.HeaderCell.Width(fromW).Render(fromLabel),
 		m.theme.HeaderCell.Width(subjW).Render("SUBJECT"),
 		m.theme.HeaderCell.Width(dateW).Render("DATE"),
-		m.theme.HeaderCell.Width(flagW).Render(""),
 	)
 	b.WriteString(header)
 	b.WriteString("\n")
@@ -314,15 +313,20 @@ func (m InboxModel) View() string {
 		from := truncate(displayFrom(personRaw), fromW-2)
 		subj := truncate(displaySubject(msg), subjW-2)
 		date := truncate(humanDate(msg.Date), dateW-2)
-		flags := renderFlags(msg)
+		flags := " "
+		if isCursorRow {
+			flags = "▌"
+		} else if hasAnyFlag(msg) {
+			flags = "!"
+		}
 
-		cells := []string{
+		flagCell := m.renderCell(flags, flagW, i, colFlags, isCursorRow, msg)
+		rest := joinCells(
 			m.renderCell(from, fromW, i, colFrom, isCursorRow, msg),
 			m.renderCell(subj, subjW, i, colSubject, isCursorRow, msg),
 			m.renderCell(date, dateW, i, colDate, isCursorRow, msg),
-			m.renderCell(flags, flagW, i, colFlags, isCursorRow, msg),
-		}
-		b.WriteString(joinCells(cells...))
+		)
+		b.WriteString(flagCell + rest)
 		b.WriteString("\n")
 	}
 
@@ -347,23 +351,20 @@ func (m InboxModel) View() string {
 }
 
 func (m InboxModel) renderCell(text string, w int, row int, col inboxColumn, isCursorRow bool, msg gmail.MessageSummary) string {
-	isCursorCell := isCursorRow && col == m.cursorCol
-
-	// base style: cursor > active row > zebra
+	// base style: selected row > zebra
 	var style lipgloss.Style
 	switch {
-	case isCursorCell:
-		style = m.theme.CursorCell.Width(w)
 	case isCursorRow:
-		style = m.theme.ActiveRowCell.Width(w)
+		style = m.theme.CursorCell.Width(w)
 	case row%2 == 0:
 		style = m.theme.Cell.Width(w)
 	default:
 		style = m.theme.AltCell.Width(w)
 	}
 
-	// emphasize unread From column
-	if col == colFrom {
+	// emphasize unread / muted on From column (only when not selected, so the
+	// selection style stays consistent across the whole row)
+	if !isCursorRow && col == colFrom {
 		if !msg.IsRead {
 			style = style.Foreground(lipgloss.Color(theme.ColorAccentSoft)).Bold(true)
 		} else {
@@ -371,7 +372,14 @@ func (m InboxModel) renderCell(text string, w int, row int, col inboxColumn, isC
 		}
 	}
 	if col == colFlags {
-		style = style.Foreground(lipgloss.Color(theme.ColorAccent))
+		switch {
+		case isCursorRow && hasAnyFlag(msg):
+			style = style.Foreground(lipgloss.Color(theme.ColorAccent)).Bold(true)
+		case isCursorRow:
+			style = style.Foreground(lipgloss.Color(theme.ColorFG)).Bold(true)
+		case hasAnyFlag(msg):
+			style = style.Foreground(lipgloss.Color(theme.ColorAccent)).Bold(true)
+		}
 	}
 
 	return style.Render(text)
@@ -443,21 +451,8 @@ func sameDay(a, b time.Time) bool {
 	return ay == by && am == bm && ad == bd
 }
 
-func renderFlags(m gmail.MessageSummary) string {
-	var parts []string
-	if m.IsImportant {
-		parts = append(parts, "★")
-	}
-	if !m.IsRead {
-		parts = append(parts, "●")
-	}
-	if m.HasAttachment {
-		parts = append(parts, "@")
-	}
-	if len(parts) == 0 {
-		return " "
-	}
-	return strings.Join(parts, " ")
+func hasAnyFlag(m gmail.MessageSummary) bool {
+	return m.IsStarred || m.IsImportant || !m.IsRead || m.HasAttachment
 }
 
 func truncate(s string, w int) string {
