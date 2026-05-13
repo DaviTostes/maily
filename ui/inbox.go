@@ -314,10 +314,17 @@ func (m InboxModel) View() string {
 		subj := truncate(displaySubject(msg), subjW-2)
 		date := truncate(humanDate(msg.Date), dateW-2)
 		flags := " "
-		if isCursorRow {
+		switch {
+		case isCursorRow:
 			flags = "▌"
-		} else if hasAnyFlag(msg) {
+		case msg.IsStarred:
+			flags = "*"
+		case msg.IsImportant:
 			flags = "!"
+		case !msg.IsRead:
+			flags = "•"
+		case msg.HasAttachment:
+			flags = "@"
 		}
 
 		flagCell := m.renderCell(flags, flagW, i, colFlags, isCursorRow, msg)
