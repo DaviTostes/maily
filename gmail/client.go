@@ -1,9 +1,11 @@
 package gmail
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"fmt"
+	"io"
 	"mime"
 	"net/http"
 	"net/mail"
@@ -13,6 +15,7 @@ import (
 	"time"
 
 	htmltomarkdown "github.com/JohannesKaufmann/html-to-markdown/v2"
+	"golang.org/x/net/html/charset"
 	gmailapi "google.golang.org/api/gmail/v1"
 	"google.golang.org/api/option"
 )
@@ -37,6 +40,7 @@ type FullMessage struct {
 	MessageID   string // RFC 822 Message-Id header value
 	References  string
 	Body        string
+	PlainText   bool // Body is the sender's text/plain part, not converted HTML
 	Attachments []string
 	Images      []string // remote http(s) <img src> URLs from HTML body
 }
@@ -197,14 +201,17 @@ func (c *Client) GetMessage(id string) (FullMessage, error) {
 		full.MessageID = headerValue(msg.Payload.Headers, "Message-Id")
 		full.References = headerValue(msg.Payload.Headers, "References")
 
-		var body string
+		var markdown string
 		if html := pickBodyPart(msg.Payload, "text/html"); html != "" {
-			body = htmlToMarkdown(html)
+			markdown = htmlToMarkdown(html)
 			full.Images = extractImageURLs(html)
-		} else {
-			body = pickBodyPart(msg.Payload, "text/plain")
 		}
-		full.Body = normalizeNewlines(body)
+		plain := pickBodyPart(msg.Payload, "text/plain")
+		if preferPlain(plain, markdown) {
+			full.Body, full.PlainText = normalizeNewlines(plain), true
+		} else {
+			full.Body = normalizeNewlines(markdown)
+		}
 		full.Attachments = collectAttachments(msg.Payload)
 	}
 	return full, nil
@@ -215,14 +222,11 @@ func pickBodyPart(p *gmailapi.MessagePart, mimeType string) string {
 		return ""
 	}
 	if strings.EqualFold(p.MimeType, mimeType) && p.Body != nil && p.Body.Data != "" {
-		data, err := base64.URLEncoding.DecodeString(p.Body.Data)
+		data, err := decodeBody(p.Body.Data)
 		if err != nil {
-			data, err = base64.StdEncoding.DecodeString(p.Body.Data)
-			if err != nil {
-				return ""
-			}
+			return ""
 		}
-		return string(data)
+		return toUTF8(data, headerValue(p.Headers, "Content-Type"))
 	}
 	for _, sub := range p.Parts {
 		if got := pickBodyPart(sub, mimeType); got != "" {
@@ -230,6 +234,66 @@ func pickBodyPart(p *gmailapi.MessagePart, mimeType string) string {
 		}
 	}
 	return ""
+}
+
+var urlWordRe = regexp.MustCompile(`\S*(?:https?://|www\.)\S*`)
+
+// visibleWords counts words a reader would actually see: URLs are dropped so a
+// wall of tracking links can't make a stub look substantial.
+func visibleWords(s string) int {
+	return len(strings.Fields(urlWordRe.ReplaceAllString(s, " ")))
+}
+
+// preferPlain decides whether to show the sender's own text/plain part instead
+// of the HTML converted to markdown. Terminal mail clients traditionally
+// prefer text/plain, and it is the only rendering that survives table-based
+// layouts: converting those gives one cell per line, while the sender's plain
+// part keeps the columns they aligned by hand.
+//
+// The exception is the stub plain part ("view this message in your browser"),
+// so plain has to carry at least half the words of the HTML to win. That ratio
+// is the knob to turn if some mail picks the wrong side.
+func preferPlain(plain, markdown string) bool {
+	if strings.TrimSpace(plain) == "" {
+		return false
+	}
+	if strings.TrimSpace(markdown) == "" {
+		return true
+	}
+	return visibleWords(plain)*2 >= visibleWords(markdown)
+}
+
+// decodeBody handles the base64 variants Gmail has been seen to emit: URL-safe
+// (documented), standard, and either without padding.
+func decodeBody(s string) ([]byte, error) {
+	encodings := []*base64.Encoding{
+		base64.URLEncoding, base64.RawURLEncoding,
+		base64.StdEncoding, base64.RawStdEncoding,
+	}
+	var err error
+	for _, enc := range encodings {
+		var data []byte
+		if data, err = enc.DecodeString(s); err == nil {
+			return data, nil
+		}
+	}
+	return nil, err
+}
+
+// toUTF8 transcodes a part body to UTF-8. Gmail hands back the original bytes
+// untouched, so a windows-1252 or ISO-8859-1 mail is mojibake until converted.
+// contentType is the part's raw Content-Type header; charset.NewReader also
+// falls back to a BOM or an HTML <meta charset> when it carries no charset.
+func toUTF8(data []byte, contentType string) string {
+	r, err := charset.NewReader(bytes.NewReader(data), contentType)
+	if err != nil {
+		return string(data)
+	}
+	out, err := io.ReadAll(r)
+	if err != nil {
+		return string(data)
+	}
+	return string(out)
 }
 
 func collectAttachments(p *gmailapi.MessagePart) []string {

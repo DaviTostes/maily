@@ -252,7 +252,7 @@ func (m InboxModel) columnWidths() (fromW, subjW, dateW, flagW int) {
 func (m InboxModel) renderTabs() string {
 	tabs := []Mailbox{MailboxInbox, MailboxSent}
 	active := lipgloss.NewStyle().
-		Foreground(lipgloss.Color(theme.ColorBG)).
+		Foreground(lipgloss.Color(theme.ColorInk)).
 		Background(lipgloss.Color(theme.ColorAccent)).
 		Bold(true).
 		Padding(0, 2)

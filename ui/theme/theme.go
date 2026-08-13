@@ -2,23 +2,29 @@ package theme
 
 import "github.com/charmbracelet/lipgloss"
 
-// Raw palette
+// Raw palette — black, white, gray. Nothing else.
+//
+// An empty color is not black: lipgloss emits no escape for it, so the
+// terminal's own background shows through untouched. Every full-width
+// surface is empty on purpose — painting them would kill terminal
+// transparency. Only small chrome (cursor row, status pills) is filled.
 const (
-	ColorBG         = "#050509"
-	ColorSurface    = "#0B0A12"
-	ColorSurfaceAlt = "#110E1B"
-	ColorHeaderBG   = "#5A2E96"
-	ColorHeaderFG   = "#F7F4FF"
-	ColorAccent     = "#5EEBFF"
-	ColorAccentSoft = "#B58CFF"
-	ColorSuccess    = "#77F2C6"
-	ColorWarning    = "#FFCB6B"
-	ColorDanger     = "#FF8FA3"
-	ColorBorder     = "#2B1D45"
-	ColorMuted      = "#8F96A8"
-	ColorFG         = "#F7F4FF"
+	ColorSurface    = "" // transparent
+	ColorSurfaceAlt = "" // transparent — no zebra stripe, it would need a fill
+	ColorHeaderBG   = "" // transparent; headers carry weight via bold + white
+	ColorHeaderFG   = "#FFFFFF"
+	ColorInk        = "#000000" // text on filled (light) chrome
+	ColorAccent     = "#FFFFFF"
+	ColorAccentSoft = "#BFBFBF"
+	// Severity is a brightness ladder, not a hue: danger is loudest.
+	ColorSuccess = "#8A8A8A"
+	ColorWarning = "#BFBFBF"
+	ColorDanger  = "#FFFFFF"
+	ColorBorder  = "#3A3A3A"
+	ColorMuted   = "#8A8A8A"
+	ColorFG      = "#E6E6E6"
 
-	ColorSurfaceBright = "#1A1530"
+	ColorSurfaceBright = "#303030" // cursor row / active row — the one fill
 )
 
 type Theme struct {
@@ -89,7 +95,7 @@ func New() Theme {
 
 	helpCard := lipgloss.NewStyle().
 		BorderStyle(lipgloss.RoundedBorder()).
-		BorderForeground(accentSoft).
+		BorderForeground(border).
 		Foreground(fg).
 		Background(surface).
 		Padding(1, 2)
@@ -101,8 +107,7 @@ func New() Theme {
 		BorderRight(false).
 		BorderBottom(false).
 		BorderForeground(border).
-		Foreground(fg).
-		Background(lipgloss.Color(ColorBG))
+		Foreground(fg)
 
 	statusSegment := lipgloss.NewStyle().
 		Foreground(fg).

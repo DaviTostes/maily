@@ -10,7 +10,8 @@ Read, search, reply, compose, and triage your inbox without leaving the terminal
 - **Reader** — vim-style navigation, visual selection with text objects, clickable links (OSC 8 + accent underline), and attachment badges.
 - **Compose** — plaintext compose with `To` / `Subject` / `Body` fields, focus cycling, and reply threading via `In-Reply-To` / `References`.
 - **Search** — full Gmail query syntax (e.g. `is:unread from:boss@corp.com newer_than:7d`).
-- **Background poll** — refreshes every 15s and fires a `notify-send` desktop notification for new mail.
+- **Background poll** — refreshes every 10s and fires a `notify-send` desktop notification for new mail.
+- **2FA codes** — a verification code in new mail is copied to the clipboard (`wl-copy`) and shown in the notification.
 - **Trash** — one-key archive to Gmail trash.
 - **Help overlay** — context-aware keybinding table on `?`.
 - **Responsive layout** — all views recompute on terminal resize.
@@ -98,7 +99,7 @@ maily
 | `o` | open link under cursor (`xdg-open`) |
 | `r` | reply |
 | `d` | trash |
-| `I` | open images in external viewer |
+| `I` | show images — inline in kitty, external viewer elsewhere |
 | `Esc` | exit visual / back to inbox |
 
 Markdown links are rendered with an accent underline and emit OSC 8 hyperlink escapes — clickable in terminals that support it (kitty, foot, wezterm, gnome-terminal — usually `Ctrl+Click`). Press `o` to open via `xdg-open` regardless of terminal support.
@@ -113,24 +114,25 @@ Markdown links are rendered with an accent underline and emit OSC 8 hyperlink es
 
 ## Notifications
 
-While running, maily polls Gmail every 15s in the background and merges new messages into the inbox without disturbing your cursor. New mail triggers a desktop notification via `notify-send` (requires `libnotify` on Linux). The first poll after startup never notifies — initial inbox state is treated as already-seen.
+While running, maily polls Gmail every 10s in the background and merges new messages into the inbox without disturbing your cursor. New mail triggers a desktop notification via `notify-send` (requires `libnotify` on Linux). The first poll after startup never notifies — initial inbox state is treated as already-seen.
 
-maily ships with one built-in theme — a dark, high-contrast palette with lavender and cyan accents. Colors are defined in [`ui/theme/theme.go`](ui/theme/theme.go):
+If a new message looks like a verification / 2FA mail, the code is copied to the clipboard with `wl-copy` and put in the notification title, so you can paste it without opening the mail. A code is only taken when the subject or snippet contains a word like *code*, *código*, *OTP*, *verification*, or *senha*; years and all-letter tokens are ignored, so ordinary receipts and order numbers never touch the clipboard.
+
+maily ships with one built-in theme — minimal black, white, and gray. Backgrounds are left unset so a transparent terminal stays transparent; only the cursor row and the status-bar pills are filled. Colors are defined in [`ui/theme/theme.go`](ui/theme/theme.go):
 
 | Role | Hex |
 |---|---|
-| Background | `#050509` |
-| Surface | `#0B0A12` |
-| Surface Alt | `#110E1B` |
-| Header BG | `#5A2E96` |
-| Accent (cyan) | `#5EEBFF` |
-| Accent Soft (lavender) | `#B58CFF` |
-| Success | `#77F2C6` |
-| Warning | `#FFCB6B` |
-| Danger | `#FF8FA3` |
-| Border | `#2B1D45` |
-| Muted | `#8F96A8` |
-| Foreground | `#F7F4FF` |
+| Surface / Surface Alt / Header BG | *unset (terminal background)* |
+| Surface Bright (cursor row) | `#303030` |
+| Ink (text on filled chrome) | `#000000` |
+| Accent | `#FFFFFF` |
+| Accent Soft | `#BFBFBF` |
+| Success | `#8A8A8A` |
+| Warning | `#BFBFBF` |
+| Danger | `#FFFFFF` |
+| Border | `#3A3A3A` |
+| Muted | `#8A8A8A` |
+| Foreground | `#E6E6E6` |
 
 Terminals must support 24-bit true color for accurate rendering.
 

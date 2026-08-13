@@ -11,6 +11,7 @@ import (
 	"github.com/charmbracelet/glamour/ansi"
 	"github.com/charmbracelet/glamour/styles"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/mattn/go-runewidth"
 
 	"github.com/davitostes/maily/gmail"
 	"github.com/davitostes/maily/ui/theme"
@@ -154,10 +155,10 @@ func (m ReaderModel) renderHeader() string {
 
 	var badgeStrs []string
 	for _, a := range m.message.Attachments {
-		badgeStrs = append(badgeStrs, m.theme.Badge("📎 "+a, theme.ColorBG, theme.ColorAccent))
+		badgeStrs = append(badgeStrs, m.theme.Badge("📎 "+a, theme.ColorInk, theme.ColorAccent))
 	}
 	if n := len(m.message.Images); n > 0 {
-		badgeStrs = append(badgeStrs, m.theme.Badge(fmt.Sprintf("🖼 %d image(s) — press i", n), theme.ColorBG, theme.ColorAccentSoft))
+		badgeStrs = append(badgeStrs, m.theme.Badge(fmt.Sprintf("🖼 %d image(s) — press I", n), theme.ColorInk, theme.ColorAccentSoft))
 	}
 	var extras string
 	if len(badgeStrs) > 0 {
@@ -191,12 +192,22 @@ func (m *ReaderModel) renderBody() string {
 		innerW = 100
 	}
 
-	// Extract markdown inline links and replace with their text so glamour
-	// doesn't render the URL inline (where it gets ugly-wrapped).
-	mdLinks, stripped := stripMarkdownLinks(body)
+	// A text/plain part is not markdown: glamour would reflow it and collapse
+	// the columns the sender aligned by hand. Only wrap what is too long.
+	var mdLinks []mdLinkInfo
+	stripped := body
+	if !m.message.PlainText {
+		// Extract markdown inline links and replace with their text so glamour
+		// doesn't render the URL inline (where it gets ugly-wrapped).
+		mdLinks, stripped = stripMarkdownLinks(body)
+	}
 
 	if !(m.cachedID == m.message.ID && m.cachedWidth == fullW && m.cachedPlain != "") {
-		m.cachedPlain = m.renderMarkdown(stripped, innerW)
+		if m.message.PlainText {
+			m.cachedPlain = strings.TrimRight(wrap(stripped, innerW), "\n")
+		} else {
+			m.cachedPlain = m.renderMarkdown(stripped, innerW)
+		}
 		m.cachedID = m.message.ID
 		m.cachedWidth = fullW
 	}
@@ -431,10 +442,10 @@ func (m *ReaderModel) composeView(fullW int) string {
 		Foreground(lipgloss.Color(theme.ColorFG))
 	sel := lipgloss.NewStyle().
 		Background(lipgloss.Color(theme.ColorAccentSoft)).
-		Foreground(lipgloss.Color(theme.ColorBG))
+		Foreground(lipgloss.Color(theme.ColorInk))
 	cur := lipgloss.NewStyle().
 		Background(lipgloss.Color(theme.ColorAccent)).
-		Foreground(lipgloss.Color(theme.ColorBG))
+		Foreground(lipgloss.Color(theme.ColorInk))
 	link := lipgloss.NewStyle().
 		Background(lipgloss.Color(theme.ColorSurface)).
 		Foreground(lipgloss.Color(theme.ColorAccentSoft)).
@@ -470,41 +481,56 @@ func (m *ReaderModel) composeView(fullW int) string {
 			return cellBase
 		}
 
-		var sb strings.Builder
-		col := 0
-		for col < fullW {
-			s := styleAt(col)
-			url := linkAt(col)
-			j := col + 1
-			for j < fullW && styleAt(j) == s && linkAt(j) == url {
-				j++
-			}
-			var chunk strings.Builder
-			for k := col; k < j; k++ {
-				if k < n {
-					chunk.WriteRune(runes[k])
-				} else {
-					chunk.WriteByte(' ')
-				}
-			}
+		render := func(text string, s cellStyle, url string) string {
 			var styled string
 			switch s {
 			case cellCursor:
-				styled = cur.Render(chunk.String())
+				styled = cur.Render(text)
 			case cellSel:
-				styled = sel.Render(chunk.String())
+				styled = sel.Render(text)
 			default:
 				if url != "" {
-					styled = link.Render(chunk.String())
+					styled = link.Render(text)
 				} else {
-					styled = base.Render(chunk.String())
+					styled = base.Render(text)
 				}
 			}
 			if url != "" {
 				styled = "\x1b]8;;" + url + "\x07" + styled + "\x1b]8;;\x07"
 			}
-			sb.WriteString(styled)
-			col = j
+			return styled
+		}
+
+		// Cursor and selection are rune-indexed, but the terminal budget is in
+		// cells: emoji and CJK take two. Track both or wide runes overflow
+		// fullW, wrap, and shove every following line out of place.
+		var sb strings.Builder
+		cells, k := 0, 0
+		for k < n && cells < fullW {
+			s, url := styleAt(k), linkAt(k)
+			start := k
+			for k < n && styleAt(k) == s && linkAt(k) == url {
+				w := runewidth.RuneWidth(runes[k])
+				if cells+w > fullW {
+					break
+				}
+				cells += w
+				k++
+			}
+			if k == start {
+				break // wide rune straddling the right edge — drop it
+			}
+			sb.WriteString(render(string(runes[start:k]), s, url))
+		}
+		// Pad to full width so line-visual selection extends past end of line.
+		for cells < fullW {
+			s := styleAt(k)
+			start := k
+			for cells < fullW && styleAt(k) == s {
+				cells++
+				k++
+			}
+			sb.WriteString(render(strings.Repeat(" ", k-start), s, ""))
 		}
 		out[i] = sb.String()
 	}
@@ -705,6 +731,19 @@ func wrapLine(line string, w int) string {
 	}
 	cur := ""
 	for _, word := range words {
+		// A single word wider than the viewport (long URLs) would otherwise sit
+		// on an over-long line and get cut off at the right edge.
+		for lipgloss.Width(word) > w {
+			head, tail := splitAtWidth(word, w)
+			if cur != "" {
+				out.WriteString(cur)
+				out.WriteByte('\n')
+				cur = ""
+			}
+			out.WriteString(head)
+			out.WriteByte('\n')
+			word = tail
+		}
 		if cur == "" {
 			cur = word
 			continue
@@ -721,6 +760,19 @@ func wrapLine(line string, w int) string {
 		out.WriteString(cur)
 	}
 	return out.String()
+}
+
+// splitAtWidth cuts s at the last rune that still fits in w display cells.
+func splitAtWidth(s string, w int) (head, tail string) {
+	cells := 0
+	for i, r := range s {
+		rw := runewidth.RuneWidth(r)
+		if cells+rw > w {
+			return s[:i], s[i:]
+		}
+		cells += rw
+	}
+	return s, ""
 }
 
 var _ = fmt.Sprintf

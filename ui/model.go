@@ -23,6 +23,20 @@ func wlCopy(s string) error {
 	return cmd.Run()
 }
 
+func isKitty() bool {
+	return os.Getenv("KITTY_WINDOW_ID") != "" || strings.Contains(os.Getenv("TERM"), "kitty")
+}
+
+// showImagesInline hands the URLs to kitty's icat kitten, which downloads and
+// draws them in the terminal itself. The TUI is suspended for the duration;
+// --hold keeps the images up until a keypress, then bubbletea repaints.
+func showImagesInline(urls []string) tea.Cmd {
+	args := append([]string{"+kitten", "icat", "--hold"}, urls...)
+	return tea.ExecProcess(exec.Command("kitty", args...), func(err error) tea.Msg {
+		return imagesDoneMsg{err: err}
+	})
+}
+
 func openExternal(u string) {
 	var cmd *exec.Cmd
 	switch runtime.GOOS {
@@ -68,6 +82,10 @@ type trashResultMsg struct {
 	err error
 }
 
+type imagesDoneMsg struct {
+	err error
+}
+
 type clearStatusMsg struct{}
 
 type markAllReadDoneMsg struct {
@@ -89,7 +107,7 @@ type mailboxBucket struct {
 	loaded   bool
 }
 
-const pollInterval = 15 * time.Second
+const pollInterval = 10 * time.Second
 
 type Model struct {
 	state     AppState
@@ -183,12 +201,18 @@ func (m Model) pollFetch(mb Mailbox, query string) tea.Cmd {
 	}
 }
 
-func notifyNewMail(items []gmail.MessageSummary) {
+// notifyNewMail fires a desktop notification. A non-empty code has already
+// been put on the clipboard and leads the body — that is the whole reason the
+// notification is worth reading.
+func notifyNewMail(items []gmail.MessageSummary, code string) {
 	if len(items) == 0 {
 		return
 	}
 	title := fmt.Sprintf("Maily: %d new email(s)", len(items))
 	var bodyLines []string
+	if code != "" {
+		title = "Maily: code " + code + " (copied)"
+	}
 	const maxShown = 3
 	for i, it := range items {
 		if i >= maxShown {
@@ -386,9 +410,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.inbox.MergeMessages(msg.messages)
 		}
 		if len(fresh) > 0 && msg.mailbox == MailboxInbox {
-			notifyNewMail(fresh)
-			m.statusbar.SetMessage(fmt.Sprintf("%d new email(s)", len(fresh)), MsgSuccess)
-			cmds = append(cmds, clearStatusAfter(3*time.Second))
+			status := fmt.Sprintf("%d new email(s)", len(fresh))
+			code, sender := findNewCode(fresh)
+			if code != "" {
+				if err := wlCopy(code); err != nil {
+					code = "" // clipboard failed — don't claim it was copied
+				} else {
+					status = fmt.Sprintf("Code %s copied (%s) · %s", code, sender, status)
+				}
+			}
+			notifyNewMail(fresh, code)
+			m.statusbar.SetMessage(status, MsgSuccess)
+			cmds = append(cmds, clearStatusAfter(6*time.Second))
 		}
 
 	case messageLoadedMsg:
@@ -455,6 +488,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.inbox.MarkAllReadLocal(msg.ids)
 		m.statusbar.SetMessage(fmt.Sprintf("Marked %d as read", len(msg.ids)), MsgSuccess)
 		cmds = append(cmds, clearStatusAfter(2*time.Second))
+
+	case imagesDoneMsg:
+		if msg.err != nil {
+			m.statusbar.SetMessage("Images: "+truncMsg(msg.err.Error(), 50), MsgError)
+			cmds = append(cmds, clearStatusAfter(4*time.Second))
+			break
+		}
+		m.statusbar.ClearMessage()
 
 	case clearStatusMsg:
 		m.statusbar.ClearMessage()
@@ -785,12 +826,16 @@ func (m *Model) handleReaderKey(msg tea.KeyMsg) tea.Cmd {
 		if n > maxOpen {
 			n = maxOpen
 		}
-		for _, u := range urls[:n] {
-			openExternal(u)
-		}
 		extra := ""
 		if len(urls) > maxOpen {
 			extra = fmt.Sprintf(" (of %d, capped at %d)", len(urls), maxOpen)
+		}
+		if isKitty() {
+			m.statusbar.SetMessage(fmt.Sprintf("Showing %d image(s)%s", n, extra), MsgSuccess)
+			return showImagesInline(urls[:n])
+		}
+		for _, u := range urls[:n] {
+			openExternal(u)
 		}
 		m.statusbar.SetMessage(fmt.Sprintf("Opened %d image(s)%s", n, extra), MsgSuccess)
 		return clearStatusAfter(2 * time.Second)

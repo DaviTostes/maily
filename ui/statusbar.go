@@ -48,17 +48,17 @@ func (m *StatusBarModel) ClearMessage() {
 func (m StatusBarModel) modeBadge() string {
 	switch m.state {
 	case StateInbox:
-		return m.theme.Badge("INBOX", theme.ColorBG, theme.ColorAccent)
+		return m.theme.Badge("INBOX", theme.ColorInk, theme.ColorAccent)
 	case StateReader:
-		return m.theme.Badge("READ", theme.ColorBG, theme.ColorAccentSoft)
+		return m.theme.Badge("READ", theme.ColorInk, theme.ColorAccentSoft)
 	case StateCompose:
-		return m.theme.Badge("COMPOSE", theme.ColorBG, theme.ColorWarning)
+		return m.theme.Badge("COMPOSE", theme.ColorInk, theme.ColorWarning)
 	case StateSearch:
-		return m.theme.Badge("SEARCH", theme.ColorBG, theme.ColorSuccess)
+		return m.theme.Badge("SEARCH", theme.ColorInk, theme.ColorSuccess)
 	case StateHelp:
-		return m.theme.Badge("HELP", theme.ColorBG, theme.ColorAccentSoft)
+		return m.theme.Badge("HELP", theme.ColorInk, theme.ColorAccentSoft)
 	}
-	return m.theme.Badge("?", theme.ColorBG, theme.ColorMuted)
+	return m.theme.Badge("?", theme.ColorInk, theme.ColorMuted)
 }
 
 func (m StatusBarModel) messageBadge() string {
@@ -67,11 +67,11 @@ func (m StatusBarModel) messageBadge() string {
 	}
 	switch m.level {
 	case MsgError:
-		return m.theme.Badge(m.message, theme.ColorBG, theme.ColorDanger)
+		return m.theme.Badge(m.message, theme.ColorInk, theme.ColorDanger)
 	case MsgSuccess:
-		return m.theme.Badge(m.message, theme.ColorBG, theme.ColorSuccess)
+		return m.theme.Badge(m.message, theme.ColorInk, theme.ColorSuccess)
 	case MsgWarning:
-		return m.theme.Badge(m.message, theme.ColorBG, theme.ColorWarning)
+		return m.theme.Badge(m.message, theme.ColorInk, theme.ColorWarning)
 	default:
 		return m.theme.Badge(m.message, theme.ColorFG, theme.ColorBorder)
 	}

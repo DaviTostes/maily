@@ -168,7 +168,7 @@ func interactiveFlow(ctx context.Context, cfg *oauth2.Config) (*oauth2.Token, er
 			return
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		_, _ = w.Write([]byte(`<html><body style="font-family:system-ui;background:#0B0A12;color:#F7F4FF;padding:3rem;text-align:center"><h1>maily authorized</h1><p>You can close this tab and return to the terminal.</p></body></html>`))
+		_, _ = w.Write([]byte(`<html><body style="font-family:system-ui;background:#000000;color:#E6E6E6;padding:3rem;text-align:center"><h1>maily authorized</h1><p>You can close this tab and return to the terminal.</p></body></html>`))
 		ch <- result{code: code}
 	})
 
